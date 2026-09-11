@@ -1,0 +1,23 @@
+# Code only. Operational data lives in private Google Drive snapshots.
+*.xlsx
+*.csv
+*.zip
+*.audit.json
+catalog.json
+workspace.json
+state.json
+history.json
+.env
+.env.*
+!.env.example
+.clasprc.json
+.clasp.json
+credentials*.json
+token*.json
+__pycache__/
+*.pyc
+python_packages/
+ms-playwright/
+data/
+backups/
+
