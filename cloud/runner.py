@@ -28,7 +28,10 @@ RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504}
 
 
 class BridgeRequestError(RuntimeError):
-    pass
+    def __init__(self, message, code="CONNECTION_ERROR", action=""):
+        super().__init__(message)
+        self.code = code
+        self.action = action
 
 
 def envelope(secret, payload, timestamp=None, nonce=None):
@@ -60,7 +63,7 @@ class Bridge:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                timeout = min(100 if action == "commit" else 40, remaining)
+                timeout = min(100 if action in {"claim", "commit"} else 40, remaining)
                 with urlopen(Request(self.url, data=body, headers={"Content-Type": "application/json"}), timeout=timeout) as response:
                     value = json.load(response)
                 if not isinstance(value, dict):
@@ -78,16 +81,16 @@ class Bridge:
                     if ref:
                         last_error += f" 참조: {ref}"
                     if code not in RETRYABLE_CODES or value.get("retryable") is not True:
-                        raise BridgeRequestError(last_error)
+                        raise BridgeRequestError(last_error, code, action)
                 else:
                     return value["value"]
             except HTTPError as exc:
                 last_error = f"Google 연결 HTTP 오류 [{exc.code}; {action}]"
                 if exc.code not in RETRYABLE_HTTP:
-                    raise BridgeRequestError(last_error) from None
+                    raise BridgeRequestError(last_error, "HTTP_" + str(exc.code), action) from None
             except URLError as exc:
                 if isinstance(exc.reason, ssl.SSLError):
-                    raise BridgeRequestError("보안 연결 인증서 확인에 실패했습니다. [TLS_ERROR]") from None
+                    raise BridgeRequestError("보안 연결 인증서 확인에 실패했습니다. [TLS_ERROR]", "TLS_ERROR", action) from None
                 last_error = f"네트워크 연결이 일시적으로 끊겼습니다. [{action}]"
             except (TimeoutError, json.JSONDecodeError, ConnectionError):
                 last_error = f"Google 응답이 지연되거나 불완전합니다. [{action}]"
@@ -97,7 +100,7 @@ class Bridge:
                     break
                 print(f"Cloud connection retry {attempt + 1}/4 ({action}).", flush=True)
                 time.sleep(delay)
-        raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error)
+        raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error, "RETRY_EXHAUSTED", action)
 
 
 def execute(bridge, manager, job):
@@ -160,6 +163,9 @@ if __name__ == "__main__":
     try:
         run(Bridge(os.environ["BRIDGE_URL"], os.environ["BRIDGE_SECRET"], os.environ["JOB_ID"],
             os.environ.get("GITHUB_RUN_ID", "local") + ":" + os.environ.get("GITHUB_RUN_ATTEMPT", "1")))
+    except BridgeRequestError as exc:
+        print(f"Cloud connection failed [{exc.code}; {exc.action}]. Open the private web app for details.", file=sys.stderr)
+        sys.exit(1)
     except Exception:
         # Avoid dumping URLs, request envelopes or local workbook content into Actions logs.
         print("Cloud job failed. Open the private web app job log for details.", file=sys.stderr)
