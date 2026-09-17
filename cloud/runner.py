@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import ssl
 import sys
 import tempfile
 import time
@@ -22,6 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from cloud.snapshot import digest, pack, unpack
 
 ID_RE = re.compile(r"^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$")
+RETRYABLE_CODES = {"BUSY", "SERVICE_TEMPORARY"}
+RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504}
+
+
+class BridgeRequestError(RuntimeError):
+    pass
 
 
 def envelope(secret, payload, timestamp=None, nonce=None):
@@ -44,18 +51,53 @@ class Bridge:
 
     def call(self, action, **kwargs):
         payload = {"action": action, "job_id": self.job_id, "execution": self.execution, "lease": self.lease, **kwargs}
-        for attempt in range(3):
+        # Stay below the five-minute heartbeat expiry; retry this request, not the collection.
+        deadline = time.monotonic() + 210
+        last_error = "클라우드 연결 응답이 없습니다."
+        for attempt in range(5):
             body = json.dumps(envelope(self.secret, payload)).encode()
             try:
-                with urlopen(Request(self.url, data=body, headers={"Content-Type": "application/json"}), timeout=100) as response:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                timeout = min(100 if action == "commit" else 40, remaining)
+                with urlopen(Request(self.url, data=body, headers={"Content-Type": "application/json"}), timeout=timeout) as response:
                     value = json.load(response)
+                if not isinstance(value, dict):
+                    raise BridgeRequestError("클라우드 응답 형식이 올바르지 않습니다. [INVALID_RESPONSE]")
                 if not value.get("ok"):
-                    raise RuntimeError(value.get("error", "Bridge request rejected"))
-                return value["value"]
-            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
-                if attempt == 2:
-                    raise RuntimeError("Drive bridge unavailable; check the job status before requesting another run") from None
-                time.sleep(2 ** attempt)
+                    code = str(value.get("code", "REQUEST_REJECTED"))
+                    if not re.fullmatch(r"[A-Z_]{1,40}", code):
+                        code = "REQUEST_REJECTED"
+                    stage = value.get("stage", action)
+                    if not isinstance(stage, str) or not re.fullmatch(r"[a-z_]{1,40}", stage):
+                        stage = action
+                    ref = value.get("reference", "")
+                    ref = ref if isinstance(ref, str) and ID_RE.fullmatch(ref) else ""
+                    last_error = f"{str(value.get('error', '클라우드 요청이 거절됐습니다.'))[:250]} [{code}; {stage}]"
+                    if ref:
+                        last_error += f" 참조: {ref}"
+                    if code not in RETRYABLE_CODES or value.get("retryable") is not True:
+                        raise BridgeRequestError(last_error)
+                else:
+                    return value["value"]
+            except HTTPError as exc:
+                last_error = f"Google 연결 HTTP 오류 [{exc.code}; {action}]"
+                if exc.code not in RETRYABLE_HTTP:
+                    raise BridgeRequestError(last_error) from None
+            except URLError as exc:
+                if isinstance(exc.reason, ssl.SSLError):
+                    raise BridgeRequestError("보안 연결 인증서 확인에 실패했습니다. [TLS_ERROR]") from None
+                last_error = f"네트워크 연결이 일시적으로 끊겼습니다. [{action}]"
+            except (TimeoutError, json.JSONDecodeError, ConnectionError):
+                last_error = f"Google 응답이 지연되거나 불완전합니다. [{action}]"
+            if attempt < 4:
+                delay = 2 ** (attempt + 1)
+                if deadline - time.monotonic() <= delay:
+                    break
+                print(f"Cloud connection retry {attempt + 1}/4 ({action}).", flush=True)
+                time.sleep(delay)
+        raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error)
 
 
 def execute(bridge, manager, job):
