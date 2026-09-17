@@ -57,6 +57,7 @@ class Bridge:
         # Stay below the five-minute heartbeat expiry; retry this request, not the collection.
         deadline = time.monotonic() + 210
         last_error = "클라우드 연결 응답이 없습니다."
+        last_code = "CONNECTION_ERROR"
         for attempt in range(5):
             body = json.dumps(envelope(self.secret, payload)).encode()
             try:
@@ -72,6 +73,7 @@ class Bridge:
                     code = str(value.get("code", "REQUEST_REJECTED"))
                     if not re.fullmatch(r"[A-Z_]{1,40}", code):
                         code = "REQUEST_REJECTED"
+                    last_code = code
                     stage = value.get("stage", action)
                     if not isinstance(stage, str) or not re.fullmatch(r"[a-z_]{1,40}", stage):
                         stage = action
@@ -85,6 +87,7 @@ class Bridge:
                 else:
                     return value["value"]
             except HTTPError as exc:
+                last_code = "HTTP_" + str(exc.code)
                 last_error = f"Google 연결 HTTP 오류 [{exc.code}; {action}]"
                 if exc.code not in RETRYABLE_HTTP:
                     raise BridgeRequestError(last_error, "HTTP_" + str(exc.code), action) from None
@@ -92,13 +95,15 @@ class Bridge:
                 if isinstance(exc.reason, ssl.SSLError):
                     raise BridgeRequestError("보안 연결 인증서 확인에 실패했습니다. [TLS_ERROR]", "TLS_ERROR", action) from None
                 last_error = f"네트워크 연결이 일시적으로 끊겼습니다. [{action}]"
-            except (TimeoutError, json.JSONDecodeError, ConnectionError):
+                last_code = "NETWORK_ERROR"
+            except (TimeoutError, json.JSONDecodeError, ConnectionError) as exc:
+                last_code = "INVALID_JSON" if isinstance(exc, json.JSONDecodeError) else "TIMEOUT" if isinstance(exc, TimeoutError) else "CONNECTION_RESET"
                 last_error = f"Google 응답이 지연되거나 불완전합니다. [{action}]"
             if attempt < 4:
                 delay = 2 ** (attempt + 1)
                 if deadline - time.monotonic() <= delay:
                     break
-                print(f"Cloud connection retry {attempt + 1}/4 ({action}).", flush=True)
+                print(f"Cloud connection retry {attempt + 1}/4 ({action}; {last_code}).", flush=True)
                 time.sleep(delay)
         raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error, "RETRY_EXHAUSTED", action)
 
