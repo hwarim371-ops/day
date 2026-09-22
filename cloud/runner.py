@@ -87,10 +87,17 @@ class Bridge:
                 else:
                     return value["value"]
             except HTTPError as exc:
-                last_code = "HTTP_" + str(exc.code)
+                failed_url = urlparse(exc.geturl())
+                # Apps Script serves JSON through a one-time ContentService URL.
+                expired_response = (exc.code == 404 and failed_url.scheme == "https"
+                                    and failed_url.netloc == "script.googleusercontent.com"
+                                    and failed_url.path == "/macros/echo")
+                last_code = "RESPONSE_URL_EXPIRED" if expired_response else "HTTP_" + str(exc.code)
                 last_error = f"Google 연결 HTTP 오류 [{exc.code}; {action}]"
-                if exc.code not in RETRYABLE_HTTP:
+                if exc.code not in RETRYABLE_HTTP and not expired_response:
                     raise BridgeRequestError(last_error, "HTTP_" + str(exc.code), action) from None
+                if expired_response:
+                    last_error = f"Google 임시 응답 주소를 다시 요청합니다. [{action}]"
             except URLError as exc:
                 if isinstance(exc.reason, ssl.SSLError):
                     raise BridgeRequestError("보안 연결 인증서 확인에 실패했습니다. [TLS_ERROR]", "TLS_ERROR", action) from None
