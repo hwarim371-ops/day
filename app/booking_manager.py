@@ -36,7 +36,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 
 class Manager:
@@ -87,6 +87,8 @@ class Manager:
                         or result.get("rules_revision") != self.rules_revision(e.company_id))
                 catalog = self.data["catalogs"].get(e.company_id)
                 groups = partition(catalog["snapshot"], self.rules(e.company_id)) if catalog else {}
+                groups = {name: [{k: item.get(k) for k in ("itemKey", "title", "decision", "reason", "mode")}
+                                 for item in items] for name, items in groups.items()}
                 rows.append({**asdict(e), "key": key, "region": self.store.meta["regions"].get(key, ""),
                     "archived": key in archived, "changed": key in self.store.meta["changed"],
                     "result": result, "proposal": self.data["proposals"].get(key), "price_amount": exact_price(e.price),
@@ -337,10 +339,11 @@ class Manager:
         with self.lock:
             if self.busy():
                 raise ValueError("작업 중에는 DB를 저장할 수 없습니다. 중지 후 저장해 주세요.")
-            if payload.get("from_proposal"):
-                for edit in payload.get("edits", []):
+            for edit in payload.get("edits", []):
+                if payload.get("from_proposal") or edit.get("from_proposal"):
                     proposal = self.data["proposals"].get(edit.get("key"), {})
-                    if proposal.get("parser_version") != PARSER_VERSION or proposal.get("review"):
+                    if (proposal.get("parser_version") != PARSER_VERSION or proposal.get("review")
+                            or proposal.get("error") or proposal.get("revision") != payload.get("revision")):
                         raise ValueError("상품 판별에서 확인 필요 항목을 먼저 객실 또는 제외로 지정해 주세요. 이전 버전의 후보는 다시 점검해야 합니다.")
             result = self.store.apply(payload)
             for edit in payload["edits"]:
