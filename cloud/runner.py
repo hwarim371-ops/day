@@ -118,17 +118,18 @@ class Bridge:
 def execute(bridge, manager, job):
     kind, payload = job["kind"], job["payload"]
     response = {}
-    if kind in {"apply", "archive", "room-rules"}:
-        if kind == "apply" and payload.get("collect_after"):
+    if kind in {"apply", "archive", "room-rules", "approve-review"}:
+        if kind in {"apply", "approve-review"} and payload.get("collect_after"):
             from naver_room_booking_upgraded import parse_date
             parse_date(payload.get("date", ""))
         if bridge.call("progress", progress={"message": "DB 수정 준비 중"})["stopRequested"]:
             raise RuntimeError("Job stopped before DB update")
-        method = {"apply": manager.apply, "archive": manager.archive, "room-rules": manager.set_rules}[kind]
+        method = {"apply": manager.apply, "archive": manager.archive, "room-rules": manager.set_rules,
+                  "approve-review": manager.approve_review}[kind]
         response = method(payload)
         if "backup" in response:
             response["backup"] = "Google Drive / 이전 스냅샷"
-        if kind != "apply" or not payload.get("collect_after"):
+        if kind not in {"apply", "approve-review"} or not payload.get("collect_after"):
             return response, {"state": "completed", "message": "DB 수정 및 저장 완료", "completed": 1, "total": 1}
         kind = "collect"
         payload = {"date": payload["date"], "revision": response["revision"], "keys": response["keys"]}

@@ -177,7 +177,7 @@ class Store:
                 continue
         return latest
 
-    def apply(self, payload):
+    def apply(self, payload, *, room_rules=None, archive_keys=()):
         with core.collection_run_lock(self.folder):
             entries, rev = self.entries()
             edits = payload.get("edits", [])
@@ -219,7 +219,8 @@ class Store:
                     for room in e.rooms:
                         owners.setdefault((e.company_id, core.normalize_name(room)), set()).add(e.excel_row)
                 return {(key, tuple(sorted(rows))) for key, rows in owners.items() if len(rows) > 1}
-            if overlaps(final) - overlaps(entries):
+            archived = set(self.meta["archived"]) | set(archive_keys)
+            if overlaps([e for e in final if entry_key(e) not in archived]) - overlaps([e for e in entries if entry_key(e) not in self.meta["archived"]]):
                 raise ValueError("같은 업체의 여러 분류에 동일 객실이 겹칩니다. 객실을 나눠서 저장해 주세요.")
             backup = self.home / ("수정전_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
             backup.mkdir()
@@ -265,6 +266,9 @@ class Store:
                     elif authority == "auto":
                         self.meta.setdefault("manual_rooms", {}).pop(key, None)
                 self.meta["changed"] = sorted(set(self.meta["changed"] + touched))
+                if room_rules is not None:
+                    self.meta.setdefault("room_rules", {}).update(room_rules)
+                self.meta["archived"] = sorted(set(self.meta["archived"]) | set(archive_keys))
                 core.refresh_db_headers(ws)
                 db_temp = self.home / "pending_db.xlsx"
                 db_wb.save(db_temp)

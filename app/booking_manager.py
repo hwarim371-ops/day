@@ -36,7 +36,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 
 class Manager:
@@ -370,7 +370,7 @@ class Manager:
                 self.log(verified["name"] + ": " + verified["status"])
                 self.persist()
 
-    def apply(self, payload):
+    def apply(self, payload, *, room_rules=None, archive_keys=()):
         with self.lock:
             if self.busy():
                 raise ValueError("작업 중에는 DB를 저장할 수 없습니다. 중지 후 저장해 주세요.")
@@ -380,7 +380,7 @@ class Manager:
                     if (proposal.get("parser_version") != PARSER_VERSION or proposal.get("review")
                             or proposal.get("error") or proposal.get("revision") != payload.get("revision")):
                         raise ValueError("상품 판별에서 확인 필요 항목을 먼저 객실 또는 제외로 지정해 주세요. 이전 버전의 후보는 다시 점검해야 합니다.")
-            result = self.store.apply(payload)
+            result = self.store.apply(payload, room_rules=room_rules, archive_keys=archive_keys)
             for edit in payload["edits"]:
                 self.data["proposals"].pop(edit.get("key"), None)
                 previous = self.data["results"].get(edit.get("key"))
@@ -390,6 +390,55 @@ class Manager:
                 if proposal.get("revision") == payload["revision"]:
                     proposal["revision"] = result["revision"]
             self.persist()
+            return result
+
+    def approve_review(self, payload):
+        with self.lock:
+            if self.busy():
+                raise ValueError("진행 중인 작업이 끝난 뒤 변경 내용을 확인해 주세요.")
+            entries, revision = self.store.entries()
+            entry = next((e for e in entries if entry_key(e) == payload.get("key")), None)
+            if not entry or revision != payload.get("revision"):
+                raise ValueError("확인 중 DB가 변경되었습니다. 최신 변경 목록을 다시 열어 주세요.")
+            company = entry.company_id
+            catalog = self.data["catalogs"].get(company)
+            if not catalog or catalog.get("checked_at") != payload.get("items_checked_at"):
+                raise ValueError("수집된 상품 목록이 바뀌었습니다. 최신 변경 목록을 다시 확인해 주세요.")
+            if payload.get("rules_revision") != self.rules_revision(company):
+                raise ValueError("다른 화면에서 상품 확인 기준이 바뀌었습니다. 다시 열어 주세요.")
+            group = [e for e in entries if e.company_id == company and entry_key(e) not in self.store.meta["archived"]]
+            targets = {entry_key(e): e for e in group}
+            cards = {item_key(c): c for c in catalog["snapshot"].get("roomCards", [])}
+            decisions = payload.get("decisions", [])
+            if (not cards or not isinstance(decisions, list) or len(decisions) != len(cards)
+                    or {v.get("itemKey") for v in decisions} != set(cards)):
+                raise ValueError("모든 수집 상품의 확인 결과가 필요합니다. 목록을 다시 열어 주세요.")
+            rooms = {key: [] for key in targets}
+            rules = copy.deepcopy(self.rules(company))
+            for choice in decisions:
+                card = cards[choice["itemKey"]]
+                mode = choice.get("mode")
+                if mode not in {"include", "exclude"}:
+                    raise ValueError("확인 필요 상품을 객실 또는 제외로 선택해 주세요.")
+                if mode == "include":
+                    target = choice.get("target_key")
+                    if target not in targets:
+                        raise ValueError("새 객실이 들어갈 분류를 선택해 주세요.")
+                    if not str(card.get("title", "")).strip():
+                        raise ValueError("이름을 확인할 수 없는 상품은 제외하거나 다시 수집해 주세요.")
+                    rooms[target].append(card["title"])
+                rules[choice["itemKey"]] = {"mode": mode, "title": card["title"], "updated_at": now()}
+            empty = {key for key in targets if not rooms[key]}
+            if set(payload.get("archive_empty_keys", [])) != empty:
+                raise ValueError("객실이 없는 분류의 보관 여부를 확인해 주세요.")
+            if len(empty) == len(targets):
+                raise ValueError("확정할 객실이 없습니다. 수집 오류인지 확인해 주세요.")
+            edits = [{**asdict(e), "key": key, "rooms": rooms[key] or e.rooms,
+                      "room_authority": "auto"} for key, e in targets.items()]
+            result = self.apply({"revision": revision, "edits": edits}, room_rules={company: rules}, archive_keys=empty)
+            result["keys"] = [key for key in result["keys"] if key not in empty]
+            result["archived_keys"] = sorted(empty)
+            result["approved_rooms"] = {key: value for key, value in rooms.items() if value}
             return result
 
     def rules(self, company):
@@ -529,6 +578,8 @@ def make_server(manager, port):
                     result = manager.archive(data)
                 elif path == "/api/room-rules":
                     result = manager.set_rules(data)
+                elif path == "/api/approve-review":
+                    result = manager.approve_review(data)
                 else:
                     return self.send(404, {"error": "알 수 없는 요청"})
                 self.send(200, result)
