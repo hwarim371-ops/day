@@ -20,10 +20,10 @@ def classify(card, rules=None):
         return "excluded", "사용자가 제외한 상품"
     if not key:
         return "review", "상품명 확인 불가"
-    if card.get("schemaVersion") == 3 and not card.get("unitEvidence"):
-        return "review", "개별 판매 항목 근거 부족"
     if rule.get("mode") == "include":
         return "room", "사용자가 객실로 확인한 상품"
+    if card.get("schemaVersion") == 3 and not card.get("unitEvidence"):
+        return "review", "개별 판매 항목 근거 부족"
     if re.search(r"공지|필독|이용안내|예약안내|안내사항|이용규칙|이용수칙|유의사항|주의사항|환불규정|배치도|오시는길|문의|상담|쿠폰|프로모션|알림받기|더보기|\*{2,}", key):
         return "excluded", "공지·안내·문의·혜택 상품"
     if re.search(r"데이유즈|dayuse|당일|캠크닉|피크닉|시간이용|이용권|입장권|오전권|오후권|바베큐장|바비큐장|캠핑식당", key):

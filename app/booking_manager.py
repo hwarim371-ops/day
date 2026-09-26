@@ -36,7 +36,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 
 class Manager:
@@ -84,7 +84,11 @@ class Manager:
                 if result:
                     result["stale"] = (result.get("fingerprint") != fingerprint(e)
                         or result.get("parser_version") != PARSER_VERSION
-                        or result.get("rules_revision") != self.rules_revision(e.company_id))
+                        or result.get("rules_revision") != self.rules_revision(e.company_id)
+                        or key in self.store.meta["changed"])
+                    if result.get("superseded"):
+                        result["previous_status"] = result["status"]
+                        result["status"] = "수정 저장 완료 · 재수집 대기"
                 catalog = self.data["catalogs"].get(e.company_id)
                 groups = partition(catalog["snapshot"], self.rules(e.company_id)) if catalog else {}
                 groups = {name: [{k: item.get(k) for k in ("itemKey", "title", "decision", "reason", "mode")}
@@ -94,6 +98,7 @@ class Manager:
                     "result": result, "proposal": self.data["proposals"].get(key), "price_amount": exact_price(e.price),
                     "item_groups": groups, "rules_revision": self.rules_revision(e.company_id),
                     "items_checked_at": catalog.get("checked_at") if catalog else None})
+                rows[-1]["room_authority"] = "manual" if self.manual_rooms(e) else "auto"
             return copy.deepcopy({"version": VERSION, "parser_version": PARSER_VERSION, "folder": str(self.store.folder), "today": date.today().isoformat(),
                 "revision": rev, "entries": rows, "job": self.job, "jobs": self.data["jobs"][:30],
                 "discoveries": self.data["discoveries"], "busy": self.busy()})
@@ -158,23 +163,45 @@ class Manager:
                 self.persist()
                 atomic_json(self.store.home / (self.job["id"] + ".json"), self.job)
 
+    def manual_rooms(self, entry):
+        saved = self.store.meta.get("manual_rooms", {}).get(entry_key(entry), {})
+        return bool(saved) and saved.get("rooms") == entry.rooms
+
+    def entry_snapshot(self, entry, snapshot):
+        rules = self.rules(entry.company_id)
+        if self.manual_rooms(entry):
+            # User-confirmed rooms win over all automatic and older product decisions.
+            cards = snapshot.get("roomCards", [])
+            keys = core.normalized_room_list(entry.rooms)
+            chosen = [core.choose_best_room_card(key, cards, [], keys)[0] for key in keys]
+            included = {item_key(card) for card in chosen if card is not None}
+            rules = {item_key(card): {"mode": "include" if item_key(card) in included else "exclude"} for card in cards}
+        return {**snapshot, "roomRules": rules}
+
     def _proposal(self, entry, snapshot, revision):
-        snapshot = {**snapshot, "roomRules": self.rules(entry.company_id)}
-        filtered, categories = filtered_snapshot(snapshot, self.rules(entry.company_id))
+        snapshot = self.entry_snapshot(entry, snapshot)
+        filtered, categories = filtered_snapshot(snapshot, snapshot["roomRules"])
         detected = core.extract_detected_rooms(filtered, core.normalize_words(core.DEFAULT_STATUS_WORDS))
-        old_keys = {core.normalize_name(r) for r in entry.rooms}
-        new_keys = {core.normalize_name(r) for r in detected}
-        group = [e for e in self.store.entries()[0] if e.company_id == entry.company_id]
-        other_keys = {core.normalize_name(r) for e in group if e.excel_row != entry.excel_row for r in e.rooms}
-        added = [r for r in detected if core.normalize_name(r) not in old_keys | other_keys]
-        removed = [r for r in entry.rooms if core.normalize_name(r) not in new_keys]
+        group = [e for e in self.store.entries()[0] if e.company_id == entry.company_id
+                 and entry_key(e) not in self.store.meta["archived"]]
+        matched_titles, removed = set(), []
+        for member in group:
+            keys = core.normalized_room_list(member.rooms)
+            for room in member.rooms:
+                card, _ = core.choose_best_room_card(core.normalize_name(room), filtered["roomCards"], [], keys)
+                if card is not None:
+                    matched_titles.add(core.normalize_name(card.get("title")))
+                elif member.excel_row == entry.excel_row:
+                    removed.append(room)
+        manual = self.manual_rooms(entry)
+        added = [] if manual else [r for r in detected if core.normalize_name(r) not in matched_titles]
         return {"key": entry_key(entry), "revision": revision, "checked_at": now(), "detected": detected,
             "added": added, "removed": removed, "split": len(group) > 1, "before": entry.rooms,
-            "proposed": detected if len(group) == 1 and detected else entry.rooms,
+            "proposed": detected if not manual and len(group) == 1 and detected else entry.rooms,
             "changed": bool(added or removed or categories["review"]), "safe": bool(detected) and len(group) == 1 and not categories["review"],
             "review": [{"title": c["title"], "reason": c["reason"]} for c in categories["review"]],
             "excluded": [{"title": c["title"], "reason": c["reason"]} for c in categories["excluded"]],
-            "parser_version": PARSER_VERSION}
+            "parser_version": PARSER_VERSION, "manual": manual}
 
     def _inspect(self, kind, entries, checkin):
         words = core.normalize_words(core.DEFAULT_STATUS_WORDS)
@@ -197,11 +224,19 @@ class Manager:
                     key = entry_key(e)
                     try:
                         url, snapshot = collector.get_snapshot(e.company_id)
-                        snapshot = {**snapshot, "roomRules": self.rules(e.company_id)}
                         with self.lock:
                             self.data["catalogs"][e.company_id] = {"snapshot": {"roomCards": snapshot.get("roomCards", []), "strictRoomCards": True}, "checked_at": now()}
                         proposal = self._proposal(e, snapshot, rev)
+                        snapshot = self.entry_snapshot(e, snapshot)
                         result = core.analyze_entry_snapshot(e, snapshot, words, "matched", url)
+                        if self.manual_rooms(e) and result.missing_count:
+                            result.status = f"수동 목록 저장됨 · 화면에서 확인 못한 객실 {result.missing_count}개"
+                        filtered, _ = filtered_snapshot(snapshot, snapshot["roomRules"])
+                        room_keys = core.normalized_room_list(e.rooms)
+                        matches = [core.choose_best_room_card(k, filtered["roomCards"], words, room_keys)[0] for k in room_keys]
+                        matched_ids = [item_key(card) for card in matches if card is not None]
+                        if len(matched_ids) != len(set(matched_ids)):
+                            result.status = "같은 화면 상품에 여러 객실명이 매칭됨 · 중복 집계 확인 필요"
                         if result.status == "정상" and proposal["added"]:
                             result.status = f"신규 객실 {len(proposal['added'])}개 확인 필요"
                         if result.status == "정상" and proposal["review"]:
@@ -340,7 +375,7 @@ class Manager:
             if self.busy():
                 raise ValueError("작업 중에는 DB를 저장할 수 없습니다. 중지 후 저장해 주세요.")
             for edit in payload.get("edits", []):
-                if payload.get("from_proposal") or edit.get("from_proposal"):
+                if edit.get("room_authority") != "manual" and (payload.get("from_proposal") or edit.get("from_proposal")):
                     proposal = self.data["proposals"].get(edit.get("key"), {})
                     if (proposal.get("parser_version") != PARSER_VERSION or proposal.get("review")
                             or proposal.get("error") or proposal.get("revision") != payload.get("revision")):
@@ -348,8 +383,11 @@ class Manager:
             result = self.store.apply(payload)
             for edit in payload["edits"]:
                 self.data["proposals"].pop(edit.get("key"), None)
+                previous = self.data["results"].get(edit.get("key"))
+                if previous:
+                    previous["superseded"] = True
             for proposal in self.data["proposals"].values():
-                if proposal["revision"] == payload["revision"]:
+                if proposal.get("revision") == payload["revision"]:
                     proposal["revision"] = result["revision"]
             self.persist()
             return result

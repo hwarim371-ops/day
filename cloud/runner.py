@@ -148,6 +148,11 @@ def execute(bridge, manager, job):
         manager.worker.join(timeout=90)
         raise
     if manager.job["state"] == "failed":
+        if response.get("keys"):
+            response["collection_failed"] = True
+            progress = copy.deepcopy(manager.job)
+            progress.update(state="issues", message="DB 수정 반영 완료 · 재수집 실패: " + manager.job["message"])
+            return response, progress
         raise RuntimeError(manager.job["message"])
     return response, copy.deepcopy(manager.job)
 

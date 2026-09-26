@@ -180,9 +180,11 @@ class Store:
     def apply(self, payload):
         with core.collection_run_lock(self.folder):
             entries, rev = self.entries()
-            if payload.get("revision") != rev:
-                raise ValueError("DB가 다른 작업에서 변경되었습니다. 새로고침 후 다시 확인해 주세요.")
             edits = payload.get("edits", [])
+            manual_force = (payload.get("force_manual") is True and isinstance(edits, list)
+                            and bool(edits) and all(e.get("room_authority") == "manual" for e in edits))
+            if payload.get("revision") != rev and not manual_force:
+                raise ValueError("DB가 다른 작업에서 변경되었습니다. 새로고침 후 다시 확인해 주세요.")
             if not edits or len(edits) > 1000:
                 raise ValueError("수정할 항목을 선택해 주세요.")
             by_key = {entry_key(e): e for e in entries}
@@ -193,7 +195,12 @@ class Store:
                     raise ValueError("항목이 변경되었거나 중복 선택되었습니다. 새로고침해 주세요.")
                 seen.add(key) if key else None
                 row = by_key[key].excel_row if key else max([e.excel_row for e in entries] + [1]) + len(added) + 1
-                entry = validate_entry(edit, row)
+                if edit.get("room_authority") not in (None, "auto", "manual"):
+                    raise ValueError("객실 목록의 확인 기준을 선택해 주세요.")
+                values = {**asdict(by_key[key]), "rooms": edit.get("rooms")} if key and edit.get("rooms_only") else edit
+                entry = validate_entry(values, row)
+                if edit.get("room_authority") == "manual" and not entry.rooms:
+                    raise ValueError("확정할 객실명을 하나 이상 입력해 주세요.")
                 if key:
                     if by_key[key].company_id != entry.company_id:
                         raise ValueError("기존 업체번호는 변경할 수 없습니다. 신규 항목으로 추가해 주세요.")
@@ -245,9 +252,18 @@ class Store:
                         for field in ("archived", "changed"):
                             self.meta[field] = [new_key if v == key else v for v in self.meta[field]]
                         self.meta["regions"][new_key] = self.meta["regions"].pop(key, "")
+                        manual = self.meta.setdefault("manual_rooms", {}).pop(key, None)
+                        if manual:
+                            self.meta["manual_rooms"][new_key] = manual
                 for edit, key in zip(edits, touched):
-                    if "region" in edit:
+                    if "region" in edit and not edit.get("rooms_only"):
                         self.meta["regions"][key] = str(edit["region"])[:150]
+                    authority = edit.get("room_authority")
+                    if authority == "manual":
+                        entry = next(e for e in final if entry_key(e) == key)
+                        self.meta.setdefault("manual_rooms", {})[key] = {"rooms": entry.rooms, "saved_at": now()}
+                    elif authority == "auto":
+                        self.meta.setdefault("manual_rooms", {}).pop(key, None)
                 self.meta["changed"] = sorted(set(self.meta["changed"] + touched))
                 core.refresh_db_headers(ws)
                 db_temp = self.home / "pending_db.xlsx"
