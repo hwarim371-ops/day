@@ -36,7 +36,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 
 class Manager:
@@ -81,11 +81,16 @@ class Manager:
                 candidates = [r for r in (self.data["results"].get(key), self.legacy.get(key)) if r]
                 result = max(candidates, key=lambda r: r.get("checked_at", "")) if candidates else None
                 result = copy.deepcopy(result)
+                attempted = bool(result and not result.get("superseded")
+                    and result.get("fingerprint") == fingerprint(e)
+                    and result.get("parser_version") == PARSER_VERSION
+                    and result.get("rules_revision") == self.rules_revision(e.company_id))
+                pending = key in self.store.meta["changed"] and not attempted
                 if result:
                     result["stale"] = (result.get("fingerprint") != fingerprint(e)
                         or result.get("parser_version") != PARSER_VERSION
                         or result.get("rules_revision") != self.rules_revision(e.company_id)
-                        or key in self.store.meta["changed"])
+                        or pending)
                     if result.get("superseded"):
                         result["previous_status"] = result["status"]
                         result["status"] = "수정 저장 완료 · 재수집 대기"
@@ -94,7 +99,7 @@ class Manager:
                 groups = {name: [{k: item.get(k) for k in ("itemKey", "title", "decision", "reason", "mode")}
                                  for item in items] for name, items in groups.items()}
                 rows.append({**asdict(e), "key": key, "region": self.store.meta["regions"].get(key, ""),
-                    "archived": key in archived, "changed": key in self.store.meta["changed"],
+                    "archived": key in archived, "changed": pending, "pending_collection": pending,
                     "result": result, "proposal": self.data["proposals"].get(key), "price_amount": exact_price(e.price),
                     "item_groups": groups, "rules_revision": self.rules_revision(e.company_id),
                     "items_checked_at": catalog.get("checked_at") if catalog else None})
@@ -208,6 +213,7 @@ class Manager:
         _, rev = self.store.entries()
         wb = None
         collected_normal = []
+        attempted_keys = []
         results = []
         if kind == "collect":
             if self.store.result.exists():
@@ -241,7 +247,8 @@ class Manager:
                             result.status = f"신규 객실 {len(proposal['added'])}개 확인 필요"
                         if result.status == "정상" and proposal["review"]:
                             result.status = f"상품 판별 필요 {len(proposal['review'])}개: 객실/제외 선택 필요"
-                        group = [v for v in self.store.entries()[0] if v.company_id == e.company_id and v.excel_row != e.excel_row]
+                        group = [v for v in self.store.entries()[0] if v.company_id == e.company_id and v.excel_row != e.excel_row
+                                 and entry_key(v) not in self.store.meta["archived"]]
                         if any(set(core.normalized_room_list(e.rooms)) & set(core.normalized_room_list(v.rooms)) for v in group):
                             result.status = "분류 간 객실 중복: 가동률 중복 집계 주의"
                         with self.lock:
@@ -254,6 +261,7 @@ class Manager:
                                     "checked_at": now(), "date": checkin.isoformat(), "fingerprint": fingerprint(e),
                                     "parser_version": PARSER_VERSION, "rules_revision": self.rules_revision(e.company_id),
                                     "excluded_items": proposal["excluded"], "review_items": proposal["review"]}
+                                attempted_keys.append(key)
                             self.job["completed"] += 1
                             self.job["normal" if result.status == "정상" else "issues"] += 1
                         if wb is not None and result.status == "정상":
@@ -277,6 +285,7 @@ class Manager:
                                     "matched": 0, "missing": len(e.rooms), "db_count": len(e.rooms),
                                     "checked_at": now(), "date": checkin.isoformat(), "fingerprint": fingerprint(e),
                                     "parser_version": PARSER_VERSION, "rules_revision": self.rules_revision(e.company_id)}
+                                attempted_keys.append(key)
                         self.log(e.sheet_title + ": " + str(exc))
                         if "접근 제한" in str(exc) or "접근을 제한" in str(exc):
                             raise
@@ -290,8 +299,10 @@ class Manager:
                     wb.save(temp)
                     os.replace(temp, self.store.result)
                     self.job["result_saved"] = True
-                    self.store.meta["changed"] = [k for k in self.store.meta["changed"] if k not in collected_normal]
                     self.log("예약현황_Result.xlsx 저장 완료. 정상 매칭 항목만 반영했습니다.")
+                # A completed attempt is different from a successful match. Keep errors visible,
+                # but never ask the user to save the same DB edit again.
+                self.store.meta["changed"] = [k for k in self.store.meta["changed"] if k not in attempted_keys]
                 if results and kind == "collect":
                     core.write_run_log(self.store.backup / ("booking_run_" + self.job["id"] + ".csv"), results)
                 self.store.save_meta()
@@ -380,15 +391,30 @@ class Manager:
                     if (proposal.get("parser_version") != PARSER_VERSION or proposal.get("review")
                             or proposal.get("error") or proposal.get("revision") != payload.get("revision")):
                         raise ValueError("상품 판별에서 확인 필요 항목을 먼저 객실 또는 제외로 지정해 주세요. 이전 버전의 후보는 다시 점검해야 합니다.")
+            before_entries = {entry_key(e): e for e in self.store.entries()[0]}
+            before_changed = set(self.store.meta["changed"])
+            before_policy = {key: (self.manual_rooms(e), self.rules_revision(e.company_id)) for key, e in before_entries.items()}
             result = self.store.apply(payload, room_rules=room_rules, archive_keys=archive_keys)
-            for edit in payload["edits"]:
+            after_entries = {entry_key(e): e for e in self.store.entries()[0]}
+            for edit, new_key in zip(payload["edits"], result["keys"]):
+                old_key = edit.get("key")
+                old = before_entries.get(old_key)
+                new = after_entries[new_key]
+                unchanged = bool(old and fingerprint(old) == fingerprint(new)
+                    and before_policy[old_key] == (self.manual_rooms(new), self.rules_revision(new.company_id)))
                 self.data["proposals"].pop(edit.get("key"), None)
-                previous = self.data["results"].get(edit.get("key"))
-                if previous:
+                previous = self.data["results"].get(old_key)
+                if unchanged:
+                    if old_key not in before_changed:
+                        self.store.meta["changed"] = [k for k in self.store.meta["changed"] if k != new_key]
+                elif previous:
                     previous["superseded"] = True
+                    if old_key != new_key:
+                        self.data["results"][new_key] = self.data["results"].pop(old_key)
             for proposal in self.data["proposals"].values():
                 if proposal.get("revision") == payload["revision"]:
                     proposal["revision"] = result["revision"]
+            self.store.save_meta()
             self.persist()
             return result
 
