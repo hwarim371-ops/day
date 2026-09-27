@@ -1,0 +1,18 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const source = fs.readFileSync('app/web/app.js', 'utf8');
+const ctx = vm.createContext({});
+vm.runInContext(source.slice(source.indexOf('function orderedEntries('), source.indexOf('function openOrderEditor(')), ctx);
+const entries = [{key:'a',excel_row:2}, {key:'b',excel_row:3}, {key:'c',excel_row:4}];
+const plain = value => JSON.parse(JSON.stringify(value));
+assert.deepEqual(plain(ctx.orderedEntries(entries, ['c','a']).map(e=>e.key)), ['c','a','b']);
+assert.deepEqual(entries.map(e=>e.key), ['a','b','c']);
+assert.deepEqual(plain(ctx.orderedEntries(entries.slice().reverse()).map(e=>e.key)), ['a','b','c']);
+assert.deepEqual(plain(ctx.orderedEntries([...entries,{key:'d',excel_row:5}], ['c','a','b']).map(e=>e.key)), ['c','a','b','d']);
+assert.deepEqual(plain(ctx.moveOrder(['a','b','c'],'a',2)), ['b','c','a']);
+assert.deepEqual(plain(ctx.moveOrder(['a','b','c'],'c',0)), ['c','a','b']);
+assert.deepEqual(plain(ctx.moveOrder(['a','b','c'],'b',-5)), ['b','a','c']);
+assert.deepEqual(plain(ctx.moveOrder(['a','b','c'],'b',30)), ['a','c','b']);
+assert.deepEqual(plain(ctx.moveOrder(['a','b'],'missing',1)), ['a','b']);
+console.log('PASS stable custom order, default DB order, new entries appended, move boundaries and non-mutating drafts');

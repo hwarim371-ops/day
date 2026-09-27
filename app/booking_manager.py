@@ -36,7 +36,7 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 
-VERSION = "2.5.0"
+VERSION = "2.5.1"
 
 
 class Manager:
@@ -46,6 +46,7 @@ class Manager:
         self.stop = threading.Event()
         self.worker = None
         self.state_path = self.store.home / "workspace.json"
+        self.order_path = self.store.home / "list_order.json"
         self.data = read_json(self.state_path, {"results": {}, "proposals": {}, "discoveries": [], "jobs": []})
         self.data.setdefault("catalogs", {})
         self.legacy = self.store.legacy_results()
@@ -104,7 +105,9 @@ class Manager:
                     "item_groups": groups, "rules_revision": self.rules_revision(e.company_id),
                     "items_checked_at": catalog.get("checked_at") if catalog else None})
                 rows[-1]["room_authority"] = "manual" if self.manual_rooms(e) else "auto"
+            order = read_json(self.order_path, {"keys": [], "revision": ""})
             return copy.deepcopy({"version": VERSION, "parser_version": PARSER_VERSION, "folder": str(self.store.folder), "today": date.today().isoformat(),
+                "display_order": order["keys"], "order_revision": order["revision"],
                 "revision": rev, "entries": rows, "job": self.job, "jobs": self.data["jobs"][:30],
                 "discoveries": self.data["discoveries"], "busy": self.busy()})
 
@@ -514,6 +517,24 @@ class Manager:
                 self.persist()
                 return {"keys": [entry_key(e) for e in group], "backup": str(backup)}
 
+    def reorder(self, payload):
+        with self.lock, core.collection_run_lock(self.store.folder):
+            entries, rev = self.store.entries()
+            order = read_json(self.order_path, {"keys": [], "revision": ""})
+            if payload.get("revision") != rev or payload.get("order_revision") != order["revision"]:
+                raise ValueError("목록 또는 순서가 변경되었습니다. 창을 닫고 새로고침한 뒤 다시 정렬해 주세요.")
+            active = {entry_key(e) for e in entries} - set(self.store.meta["archived"])
+            keys = payload.get("keys")
+            if (not isinstance(keys, list) or len(keys) > 5000
+                    or any(not isinstance(k, str) for k in keys)
+                    or len(keys) != len(set(keys)) or set(keys) != active):
+                raise ValueError("목록이 변경되었습니다. 활성 항목 전체의 순서를 확인해 주세요.")
+            known = {entry_key(e) for e in entries}
+            keys = keys + [k for k in order["keys"] if k in known and k not in active]
+            updated = {"keys": keys, "revision": secrets.token_hex(16)}
+            atomic_json(self.order_path, updated)
+            return {"display_order": keys, "order_revision": updated["revision"]}
+
     def archive(self, payload):
         with self.lock:
             if self.busy():
@@ -602,6 +623,8 @@ def make_server(manager, port):
                     result = manager.apply(data)
                 elif path == "/api/archive":
                     result = manager.archive(data)
+                elif path == "/api/list-order":
+                    result = manager.reorder(data)
                 elif path == "/api/room-rules":
                     result = manager.set_rules(data)
                 elif path == "/api/approve-review":

@@ -30,6 +30,10 @@
     if (pending.has(signature)) return pending.get(signature);
     const task = (async () => {
       const result = await rpc(path, payload, crypto.randomUUID());
+      if (path === '/api/list-order') {
+        if (cachedState) Object.assign(cachedState, result);
+        return result;
+      }
       if (path === '/api/start' || (['/api/apply', '/api/approve-review'].includes(path) && payload.collect_after && !payload.wait_for_completion)) return result;
       const banner = document.getElementById('cloudPending');
       banner.hidden = false;

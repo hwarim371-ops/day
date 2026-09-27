@@ -50,6 +50,39 @@ function manifest_(id) {
 function current_() { return manifest_(setting_('CURRENT_MANIFEST_ID')); }
 function fileUrl_(id) { return 'https://drive.google.com/file/d/' + id + '/view'; }
 
+// Display order is independent of worker snapshots and never rewrites booking data.
+function listOrder_() {
+  const id = props_().getProperty('LIST_ORDER_FILE_ID');
+  if (!id) return {keys: [], revision: ''};
+  const cache = CacheService.getScriptCache(), cached = cache.get('list-order:' + id);
+  if (cached) return JSON.parse(cached);
+  const value = json_(id), text = JSON.stringify(value);
+  if (text.length < 20000) cache.put('list-order:' + id, text, 21600);
+  return value;
+}
+function saveListOrder_(payload) {
+  const state = json_(current_().files['state.json']), order = listOrder_();
+  if (!payload || payload.revision !== state.revision || payload.order_revision !== order.revision)
+    throw new Error('목록 또는 순서가 변경되었습니다. 창을 닫고 새로고침한 뒤 다시 정렬해 주세요.');
+  const active = state.entries.filter(e => !e.archived).map(e => e.key), keys = payload.keys;
+  if (!Array.isArray(keys) || keys.length > 5000 || keys.length !== active.length
+      || new Set(keys).size !== keys.length || keys.some(k => typeof k !== 'string' || !active.includes(k)))
+    throw new Error('목록이 변경되었습니다. 활성 항목 전체의 순서를 확인해 주세요.');
+  const known = new Set(state.entries.map(e => e.key));
+  const value = {keys: keys.concat(order.keys.filter(k => known.has(k) && !active.includes(k))), revision: Utilities.getUuid()};
+  const text = JSON.stringify(value);
+  let id = props_().getProperty('LIST_ORDER_FILE_ID');
+  if (id) DriveApp.getFileById(id).setContent(text);
+  else {
+    id = saveJson_(root_(), '캠핑장_목록순서.json', value);
+    props_().setProperty('LIST_ORDER_FILE_ID', id);
+  }
+  const cache = CacheService.getScriptCache();
+  cache.remove('list-order:' + id);
+  if (text.length < 20000) cache.put('list-order:' + id, text, 21600);
+  return {display_order: value.keys, order_revision: value.revision};
+}
+
 function findJob_(id) {
   if (!UUID.test(id || '')) throw new Error('잘못된 작업번호');
   const files = jobsFolder_().getFilesByName(id + '.json');
@@ -124,12 +157,14 @@ function compactState_(state) {
 }
 function state_(knownManifest, knownJobs) {
   const snapshot = locked_(() => ({job: active_(), manifestId: setting_('CURRENT_MANIFEST_ID'),
-    ids: JSON.parse(props_().getProperty('RECENT_JOB_IDS') || '[]')}));
+    ids: JSON.parse(props_().getProperty('RECENT_JOB_IDS') || '[]'), order: listOrder_()}));
   const {job, manifestId, ids} = snapshot;
   // Immutable snapshot files and old job summaries do not need the worker lock.
   const manifest = manifest_(manifestId);
   const state = knownManifest === manifestId ? {not_modified: true} : compactState_(json_(manifest.files['state.json']));
   state.manifest = manifestId;
+  state.display_order = snapshot.order.keys;
+  state.order_revision = snapshot.order.revision;
   state.jobs_key = JSON.stringify(ids);
   if (knownJobs !== state.jobs_key) state.jobs = ids.slice(0, 1).map(id => summaryJob_(id));
   else delete state.jobs;
@@ -139,7 +174,7 @@ function state_(knownManifest, knownJobs) {
   state.job.remote_log = !!state.job.id;
   state.busy = !!job && !TERMINAL.includes(job.state);
   state.cloud = true;
-  state.version = '2.5.0';
+  state.version = '2.5.1';
   state.folder = 'Google Drive';
   state.today = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd');
   state.drive_url = 'https://drive.google.com/drive/folders/' + setting_('ROOT_FOLDER_ID');
@@ -169,6 +204,7 @@ function uiRequest(path, payload, requestId) {
       return {ok: true, value: {history: json_(current_().files['history.json'])[key] || []}};
     }
     const value = locked_(() => {
+      if (path === '/api/list-order') return saveListOrder_(payload);
       if (path === '/api/job') return publicJob_(recoverJob_(findJob_(payload.id)));
       if (path === '/api/stop') {
         const job = active_();

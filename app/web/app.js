@@ -99,6 +99,93 @@ function guarded(fn) {
 function current() {
   return data?.entries.find((e) => e.key === activeKey);
 }
+function orderedEntries(entries, order = []) {
+  const positions = new Map(order.map((key, index) => [key, index]));
+  return [...entries].sort((a, b) => {
+    const pa = positions.get(a.key), pb = positions.get(b.key);
+    if (pa !== undefined || pb !== undefined) return (pa ?? order.length) - (pb ?? order.length);
+    return a.excel_row - b.excel_row;
+  });
+}
+function moveOrder(keys, key, destination) {
+  const from = keys.indexOf(key);
+  if (from < 0 || !Number.isInteger(destination)) return keys;
+  const next = [...keys], to = Math.max(0, Math.min(keys.length - 1, destination));
+  next.splice(from, 1);
+  next.splice(to, 0, key);
+  return next;
+}
+function openOrderEditor() {
+  const entries = data.entries.filter(e => !e.archived);
+  if (entries.length < 2) return;
+  const baseline = entries.map(e => e.key);
+  let keys = [...baseline], dragKey = '', saving = false;
+  const revision = data.revision, orderRevision = data.order_revision || '';
+  openDialog('캠핑장 순서 편집', '<div class="order-toolbar"><span id="orderCount" aria-live="polite"></span><button id="resetOrder">DB 순서로</button></div><ol id="orderList" class="order-list"></ol>', [
+    ['취소', () => $("#dialog").close()],
+    ['순서 저장', async () => {
+      saving = true;
+      try {
+        const saved = await api('/api/list-order', {keys, revision, order_revision: orderRevision});
+        if (requesting) await requesting.catch(() => {});
+        Object.assign(data, saved);
+        data.entries = orderedEntries(data.entries, data.display_order);
+        render();
+        $("#dialog").close();
+        toast('목록 순서를 저장했습니다.');
+      } finally { saving = false; }
+    }, true],
+  ]);
+  const redraw = (key, action) => {
+    const byKey = new Map(entries.map(e => [e.key, e]));
+    $("#orderCount").textContent = `${keys.length}개 항목 · ${keys.some((k, i) => k !== baseline[i]) ? '저장 전 변경' : '현재 순서'}`;
+    $("#orderList").innerHTML = keys.map((k, index) => {
+      const entry = byKey.get(k);
+      return `<li data-order-key="${k}"><span class="order-number">${index + 1}</span><span class="order-name"><strong>${esc(entry.sheet_title)}</strong><small>${esc(entry.major)} · ${esc(entry.company_id)}</small></span><button class="icon-button order-grip" draggable="true" data-drag-key="${k}" title="드래그하여 이동" aria-label="${esc(entry.sheet_title)} 드래그">${icon('grip-vertical')}</button><div class="order-actions">${[['top','chevrons-up','맨 위'],['up','arrow-up','위로'],['down','arrow-down','아래로'],['bottom','chevrons-down','맨 아래']].map(([name, symbol, label]) => `<button class="icon-button" data-order-action="${name}" data-order-item="${k}" title="${label}" aria-label="${esc(entry.sheet_title)} ${label}" ${(index === 0 && ['top','up'].includes(name)) || (index === keys.length - 1 && ['down','bottom'].includes(name)) ? 'disabled' : ''}>${icon(symbol)}</button>`).join('')}</div></li>`;
+    }).join('');
+    icons();
+    const row = key && $("#orderList").querySelector(`[data-order-key="${key}"]`);
+    if (row) {
+      const button = row.querySelector(`[data-order-action="${action}"]:not(:disabled)`) || row.querySelector('button:not(:disabled)');
+      button?.focus({preventScroll:true});
+      row.scrollIntoView({block:'nearest'});
+    }
+  };
+  $("#resetOrder").onclick = () => { keys = orderedEntries(entries).map(e => e.key); redraw(); };
+  $("#orderList").onclick = event => {
+    const button = event.target.closest('[data-order-action]');
+    if (!button || button.disabled || saving) return;
+    const key = button.dataset.orderItem, action = button.dataset.orderAction, index = keys.indexOf(key);
+    keys = moveOrder(keys, key, {top:0, up:index - 1, down:index + 1, bottom:keys.length - 1}[action]);
+    redraw(key, action);
+  };
+  $("#orderList").ondragstart = event => {
+    const handle = event.target.closest('[data-drag-key]');
+    if (!handle || saving) { event.preventDefault(); return; }
+    dragKey = handle.dataset.dragKey;
+    event.dataTransfer.setData('text/plain', dragKey);
+    event.dataTransfer.effectAllowed = 'move';
+  };
+  $("#orderList").ondragover = event => {
+    if (!dragKey || saving) return;
+    const row = event.target.closest('[data-order-key]');
+    if (!row) return;
+    event.preventDefault();
+    $$('#orderList .drop-target').forEach(el => el.classList.remove('drop-target'));
+    row.classList.add('drop-target');
+  };
+  $("#orderList").ondrop = event => {
+    const row = event.target.closest('[data-order-key]');
+    if (!row || !dragKey || saving) return;
+    event.preventDefault();
+    const key = dragKey;
+    keys = moveOrder(keys, key, keys.indexOf(row.dataset.orderKey));
+    dragKey = '';
+    redraw(key, 'up');
+  };
+  $("#orderList").ondragend = () => { dragKey = ''; $$('#orderList .drop-target').forEach(el => el.classList.remove('drop-target')); };
+  redraw();
+}
 function normal(e) {
   return (
     e.result?.status === "정상" &&
@@ -198,6 +285,7 @@ async function refresh(force = false) {
   try {
     const previousEntry = data ? JSON.stringify(current()) : null;
     data = await request;
+    data.entries = orderedEntries(data.entries, data.display_order);
     if (pendingSave && data.job.id === pendingSave.id && !data.busy) {
       const saved = pendingSave;
       pendingSave = null;
@@ -266,6 +354,7 @@ function render() {
   $("#metricChanged").textContent =
     active.filter(pendingCollection).length + " 항목 재수집 대기";
   $("#addCamp").disabled = data.busy;
+  $("#editOrder").disabled = $("#catalogOrder").disabled = active.length < 2;
   $("#collectIssues").disabled = data.busy || !active.some(needsAttention);
   const latest = data.entries
     .map((e) => e.result?.checked_at || "")
@@ -1205,6 +1294,7 @@ $$("nav button").forEach(
 );
 $("#search").oninput = render;
 $("#summarySearch").oninput = () => { renderSummary(); icons(); };
+$("#editOrder").onclick = $("#catalogOrder").onclick = openOrderEditor;
 $("#addCamp").onclick = guarded(() => openAddCamp());
 $("#collectIssues").onclick = guarded(() => start("collect", data.entries.filter(e => !e.archived && needsAttention(e)).map(e => e.key)));
 $("#businessRows").onclick = guarded(async event => {
