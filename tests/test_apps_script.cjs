@@ -10,7 +10,7 @@ const secret = 'test-only-secret-not-valid-in-production-123456789';
 const requestId = () => crypto.randomUUID();
 
 function harness() {
-  const props = new Map(), files = new Map(), cache = new Map();
+  const props = new Map(), files = new Map(), cache = new Map(), triggers = [];
   let counter = 0, clock = Date.now(), failCreate = false, failJobWrite = false, dispatchCode = 204, dispatches = 0;
   let lockBusy = false, lockHeld = false;
   const reads = [], errors = [];
@@ -62,7 +62,9 @@ function harness() {
     LockService: {getScriptLock: () => ({tryLock: () => {if (lockBusy) return false; assert.equal(lockHeld, false); lockHeld = true; return true;}, releaseLock: () => {lockHeld = false;}})},
     console: {error: value => errors.push(JSON.parse(value))},
     CacheService: {getScriptCache: () => ({get: key => cache.get(key), put: (key, value) => cache.set(key, value), remove: key => cache.delete(key)})},
-    Session: {getActiveUser: () => ({getEmail: () => email})},
+    Session: {getActiveUser: () => ({getEmail: () => email}), getEffectiveUser: () => ({getEmail: () => email})},
+    ScriptApp: {getProjectTriggers: () => triggers, newTrigger: handler => ({timeBased() {return this;},
+      everyMinutes(value) {assert.equal(value, 1); return this;}, create() {triggers.push({getHandlerFunction: () => handler});}})},
     DriveApp: {getFileById: id => {if (!files.has(id)) throw Error('missing file'); return files.get(id);}, getFolderById: id => files.get(id)},
     Utilities: {
       DigestAlgorithm: {SHA_256: 'SHA_256'}, getUuid: requestId,
@@ -71,7 +73,11 @@ function harness() {
       base64Decode: text => [...Buffer.from(text, 'base64')], base64Encode: bytes => Buffer.from(bytes).toString('base64'),
       newBlob: (bytes, type, name) => new Blob(bytes, type, name),
       unzip: blob => Object.entries(JSON.parse(blob.bytes.toString())).map(([name, bytes]) => new Blob(bytes, '', name)),
-      formatDate: () => '2026-09-11'
+      formatDate: (date, zone, pattern) => {
+        assert.equal(zone, 'Asia/Seoul');
+        const korea = new Date(date.getTime() + 9 * 3600000).toISOString();
+        return pattern === 'yyyy-MM-dd HH' ? korea.slice(0, 10) + ' ' + korea.slice(11, 13) : korea.slice(0, 10);
+      }
     },
     UrlFetchApp: {fetch: () => {dispatches++; return {getResponseCode: () => dispatchCode};}},
     ContentService: {MimeType: {JSON: 'json'}, createTextOutput: text => ({text, setMimeType() {return this;}})},
@@ -92,7 +98,7 @@ function harness() {
   const claim = id => post({action: 'claim', job_id: id, execution: '100:1'});
   const action = (id, lease, verb, extra = {}) => post({action: verb, job_id: id, execution: '100:1', lease, ...extra});
   return {context, props, files, state, bundle, env, post, postEnvelope, start, claim, action,
-    setEmail: value => email = value, advance: ms => clock += ms,
+    setEmail: value => email = value, advance: ms => clock += ms, setClock: value => clock = Date.parse(value),
     failCreate: value => failCreate = value, failJobWrite: value => failJobWrite = value,
     dispatchCode: value => dispatchCode = value, dispatchCount: () => dispatches,
     lockBusy: value => lockBusy = value, reads, errors};
@@ -100,6 +106,64 @@ function harness() {
 
 let tests = 0;
 function test(name, fn) { fn(); tests++; console.log('PASS ' + name); }
+test('only owner can install a daily timer and repeated setup keeps one timer', () => {
+  const h = harness(); h.setEmail('other@example.com');
+  assert.throws(() => h.context.installDailyCollection(), /소유자/);
+  assert.equal(h.context.ScriptApp.getProjectTriggers().length, 0);
+  h.setEmail('owner@example.com'); h.context.installDailyCollection(); h.context.installDailyCollection();
+  assert.equal(h.context.ScriptApp.getProjectTriggers().length, 1);
+  assert.equal(h.dispatchCount(), 0);
+});
+test('daily trigger waits for 22:00 Korea time without reading Drive', () => {
+  const h = harness();
+  h.setClock('2026-10-09T21:59:00+09:00'); h.reads.length = 0;
+  h.context.scheduledDailyCollection_();
+  assert.equal(h.dispatchCount(), 0); assert.equal(h.reads.length, 0);
+});
+test('daily trigger collects all entries once using the current Korean date', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00');
+  const first = h.context.scheduledDailyCollection_();
+  const job = h.context.findJob_(first.job_id);
+  assert.equal(job.kind, 'collect'); assert.equal(job.payload.date, '2026-10-09');
+  assert.equal(job.payload.all, true); assert.equal(job.payload.revision, h.state.revision);
+  h.reads.length = 0; h.context.scheduledDailyCollection_();
+  assert.equal(h.dispatchCount(), 1); assert.equal(h.reads.length, 0);
+});
+test('daily trigger waits for another job instead of overlapping or losing its slot', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00');
+  const manual = h.start(); h.context.scheduledDailyCollection_();
+  assert.equal(h.dispatchCount(), 1); assert.equal(h.props.has('DAILY_COLLECTION_DATE'), false);
+  h.context.uiRequest('/api/stop', {}); h.advance(60000);
+  h.context.scheduledDailyCollection_(); assert.equal(h.dispatchCount(), 2);
+});
+test('daily trigger recovers missing date marker without duplicate dispatch', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00');
+  h.context.scheduledDailyCollection_(); h.props.delete('DAILY_COLLECTION_DATE');
+  h.context.scheduledDailyCollection_(); assert.equal(h.dispatchCount(), 1);
+  assert.equal(h.props.get('DAILY_COLLECTION_DATE'), '2026-10-09');
+});
+test('daily dispatch failure is reported once and does not retry failed collection', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00'); h.dispatchCode(403);
+  assert.throws(() => h.context.scheduledDailyCollection_(), /GitHub/);
+  h.context.scheduledDailyCollection_(); assert.equal(h.dispatchCount(), 1);
+});
+test('daily trigger requires owner and an available lock', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00');
+  h.setEmail('other@example.com'); assert.throws(() => h.context.scheduledDailyCollection_(), /소유자/);
+  h.setEmail('owner@example.com'); h.lockBusy(true);
+  assert.throws(() => h.context.scheduledDailyCollection_(), /다른 요청/);
+  assert.equal(h.dispatchCount(), 0);
+});
+test('daily trigger starts a new job next evening but not after midnight', () => {
+  const h = harness(); h.setClock('2026-10-09T22:00:00+09:00');
+  h.context.scheduledDailyCollection_(); h.context.uiRequest('/api/stop', {});
+  h.setClock('2026-10-10T00:01:00+09:00'); h.context.scheduledDailyCollection_();
+  assert.equal(h.dispatchCount(), 1);
+  h.setClock('2026-10-10T22:00:00+09:00');
+  const second = h.context.scheduledDailyCollection_();
+  assert.equal(h.context.findJob_(second.job_id).payload.date, '2026-10-10');
+  assert.equal(h.dispatchCount(), 2);
+});
 test('confirmed review dispatches one authenticated combined job', () => {
   const h = harness(), id = requestId();
   const payload = {revision: h.state.revision, collect_after: true, date: '2026-09-27', decisions: []};

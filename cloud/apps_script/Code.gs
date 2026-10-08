@@ -277,6 +277,42 @@ function dispatch_(kind, payload, requestId) {
   return {job_id: job.id, queued: true};
 }
 
+function installDailyCollection() {
+  owner_();
+  return locked_(() => {
+    const existing = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'scheduledDailyCollection_');
+    if (existing.length) return '매일 한국시간 오후 10시 자동 집계가 이미 등록되어 있습니다.';
+    ScriptApp.newTrigger('scheduledDailyCollection_').timeBased().everyMinutes(1).create();
+    return '매일 한국시간 오후 10시 자동 집계를 등록했습니다.';
+  });
+}
+
+// The private handler cannot be invoked through google.script.run.
+function scheduledDailyCollection_() {
+  const stamp = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH');
+  const date = stamp.slice(0, 10), hour = Number(stamp.slice(11));
+  if (hour < 22 || props_().getProperty('DAILY_COLLECTION_DATE') === date) return;
+  const email = Session.getEffectiveUser().getEmail().toLowerCase();
+  if (!email || email !== setting_('OWNER_EMAIL').toLowerCase()) throw new Error('자동 집계는 소유자 계정에서 설정해야 합니다.');
+  return locked_(() => {
+    if (props_().getProperty('DAILY_COLLECTION_DATE') === date) return;
+    // Stable job identity also prevents duplicates after a timeout or a partial write.
+    const hash = sha_(Utilities.newBlob('daily-collection:' + date).getBytes()).slice(0, 32);
+    const id = [hash.slice(0, 8), hash.slice(8, 12), hash.slice(12, 16), hash.slice(16, 20), hash.slice(20)].join('-');
+    if (findJob_(id)) {
+      props_().setProperty('DAILY_COLLECTION_DATE', date);
+      return;
+    }
+    const active = active_();
+    if (active && !TERMINAL.includes(active.state)) return;
+    const state = json_(current_().files['state.json']);
+    if (!state.entries.some(e => !e.archived)) return;
+    const result = dispatch_('collect', {kind: 'collect', date: date, all: true, revision: state.revision}, id);
+    props_().setProperty('DAILY_COLLECTION_DATE', date);
+    return result;
+  });
+}
+
 function decode_(body) {
   if (typeof body !== 'string' || body.length > 16000000) throw new Error('Invalid envelope');
   const env = JSON.parse(body);
