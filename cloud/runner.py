@@ -28,10 +28,11 @@ RETRYABLE_HTTP = {408, 429, 500, 502, 503, 504}
 
 
 class BridgeRequestError(RuntimeError):
-    def __init__(self, message, code="CONNECTION_ERROR", action=""):
+    def __init__(self, message, code="CONNECTION_ERROR", action="", cause_code=None):
         super().__init__(message)
         self.code = code
         self.action = action
+        self.cause_code = cause_code or code
 
 
 def envelope(secret, payload, timestamp=None, nonce=None):
@@ -54,21 +55,22 @@ class Bridge:
 
     def call(self, action, **kwargs):
         payload = {"action": action, "job_id": self.job_id, "execution": self.execution, "lease": self.lease, **kwargs}
-        # Stay below the five-minute heartbeat expiry; retry this request, not the collection.
-        deadline = time.monotonic() + 210
+        # Only startup gets a longer recovery window. Never restart collection or DB edits.
+        budget, attempts = (480, 12) if action == "claim" else (60, 3) if action == "startup_fail" else (210, 5)
+        deadline = time.monotonic() + budget
         last_error = "클라우드 연결 응답이 없습니다."
         last_code = "CONNECTION_ERROR"
-        for attempt in range(5):
+        for attempt in range(attempts):
             body = json.dumps(envelope(self.secret, payload)).encode()
             try:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
-                timeout = min(100 if action in {"claim", "commit"} else 40, remaining)
-                with urlopen(Request(self.url, data=body, headers={"Content-Type": "application/json"}), timeout=timeout) as response:
+                timeout = min(100 if action in {"claim", "commit"} else 20 if action == "startup_fail" else 40, remaining)
+                with urlopen(Request(self.url, data=body, headers={"Content-Type": "application/json", "Accept": "application/json", "Cache-Control": "no-cache"}), timeout=timeout) as response:
                     value = json.load(response)
                 if not isinstance(value, dict):
-                    raise BridgeRequestError("클라우드 응답 형식이 올바르지 않습니다. [INVALID_RESPONSE]")
+                    raise BridgeRequestError("클라우드 응답 형식이 올바르지 않습니다. [INVALID_RESPONSE]", "INVALID_RESPONSE", action)
                 if not value.get("ok"):
                     code = str(value.get("code", "REQUEST_REJECTED"))
                     if not re.fullmatch(r"[A-Z_]{1,40}", code):
@@ -106,13 +108,14 @@ class Bridge:
             except (TimeoutError, json.JSONDecodeError, ConnectionError) as exc:
                 last_code = "INVALID_JSON" if isinstance(exc, json.JSONDecodeError) else "TIMEOUT" if isinstance(exc, TimeoutError) else "CONNECTION_RESET"
                 last_error = f"Google 응답이 지연되거나 불완전합니다. [{action}]"
-            if attempt < 4:
-                delay = 2 ** (attempt + 1)
+            if attempt < attempts - 1:
+                delay = min(30, 2 ** (attempt + 1))
                 if deadline - time.monotonic() <= delay:
                     break
-                print(f"Cloud connection retry {attempt + 1}/4 ({action}; {last_code}).", flush=True)
+                print(f"Cloud connection retry {attempt + 1}/{attempts - 1} ({action}; {last_code}).", flush=True)
                 time.sleep(delay)
-        raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error, "RETRY_EXHAUSTED", action)
+        raise BridgeRequestError("자동 재연결 횟수/시간을 초과했습니다. " + last_error + f" [{last_code}]",
+                                 "RETRY_EXHAUSTED", action, last_code)
 
 
 def execute(bridge, manager, job):
@@ -160,7 +163,15 @@ def execute(bridge, manager, job):
 
 def run(bridge):
     from booking_manager import Manager
-    claim = bridge.call("claim")
+    try:
+        claim = bridge.call("claim", startup_recovery=True)
+    except BridgeRequestError as exc:
+        # A lost claim response means the server may own a lease we never received.
+        try:
+            bridge.call("startup_fail", code=exc.cause_code)
+        except Exception:
+            print("Startup failure could not reach Drive; the cloud monitor will check this run.", flush=True)
+        raise
     if claim.get("terminal"):
         print("Job already finished; no collection repeated.")
         return
@@ -189,7 +200,7 @@ if __name__ == "__main__":
         run(Bridge(os.environ["BRIDGE_URL"], os.environ["BRIDGE_SECRET"], os.environ["JOB_ID"],
             os.environ.get("GITHUB_RUN_ID", "local") + ":" + os.environ.get("GITHUB_RUN_ATTEMPT", "1")))
     except BridgeRequestError as exc:
-        print(f"Cloud connection failed [{exc.code}; {exc.action}]. Open the private web app for details.", file=sys.stderr)
+        print(f"Cloud connection failed [{exc.code}; {exc.action}; {exc.cause_code}]. Open the private web app for details.", file=sys.stderr)
         sys.exit(1)
     except Exception:
         # Avoid dumping URLs, request envelopes or local workbook content into Actions logs.

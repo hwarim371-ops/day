@@ -1,4 +1,5 @@
 name: Camping cloud job
+run-name: Camping job ${{ inputs.job_id }}
 on:
   workflow_dispatch:
     inputs:

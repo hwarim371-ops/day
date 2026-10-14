@@ -13,6 +13,7 @@ function harness() {
   const props = new Map(), files = new Map(), cache = new Map(), triggers = [];
   let counter = 0, clock = Date.now(), failCreate = false, failJobWrite = false, dispatchCode = 204, dispatches = 0;
   let lockBusy = false, lockHeld = false;
+  let githubRun = null, monitorCode = 200, monitorReads = 0;
   const reads = [], errors = [];
   class Blob {
     constructor(bytes, type = '', name = '') { this.bytes = Buffer.from(bytes); this.type = type; this.name = name; }
@@ -79,7 +80,12 @@ function harness() {
         return pattern === 'yyyy-MM-dd HH' ? korea.slice(0, 10) + ' ' + korea.slice(11, 13) : korea.slice(0, 10);
       }
     },
-    UrlFetchApp: {fetch: () => {dispatches++; return {getResponseCode: () => dispatchCode};}},
+    UrlFetchApp: {fetch: (url, options) => {
+      if (options.method === 'post') {dispatches++; return {getResponseCode: () => dispatchCode};}
+      assert.equal(lockHeld, false); monitorReads++;
+      return {getResponseCode: () => monitorCode, getContentText: () => JSON.stringify(
+        url.includes('?') ? {workflow_runs: githubRun ? [githubRun] : []} : githubRun)};
+    }},
     ContentService: {MimeType: {JSON: 'json'}, createTextOutput: text => ({text, setMimeType() {return this;}})},
     HtmlService: {createHtmlOutput: text => text, createHtmlOutputFromFile: name => ({name, setTitle() {return this;}, addMetaTag() {return this;}})}
   });
@@ -101,7 +107,9 @@ function harness() {
     setEmail: value => email = value, advance: ms => clock += ms, setClock: value => clock = Date.parse(value),
     failCreate: value => failCreate = value, failJobWrite: value => failJobWrite = value,
     dispatchCode: value => dispatchCode = value, dispatchCount: () => dispatches,
-    lockBusy: value => lockBusy = value, reads, errors};
+    lockBusy: value => lockBusy = value, reads, errors,
+    githubRun: value => githubRun = value, monitorCode: value => monitorCode = value,
+    monitorReads: () => monitorReads};
 }
 
 let tests = 0;
@@ -163,6 +171,74 @@ test('daily trigger starts a new job next evening but not after midnight', () =>
   const second = h.context.scheduledDailyCollection_();
   assert.equal(h.context.findJob_(second.job_id).payload.date, '2026-10-10');
   assert.equal(h.dispatchCount(), 2);
+});
+test('startup recovery refreshes the same lease without launching another worker', () => {
+  const h = harness(), {id} = h.start();
+  const claim = () => h.post({action: 'claim', job_id: id, execution: '100:1', startup_recovery: true});
+  const lease = claim().value.lease;
+  h.advance(6 * 60000);
+  assert.equal(claim().value.lease, lease);
+  h.advance(6 * 60000);
+  assert.equal(h.context.uiRequest('/api/state').value.busy, true);
+  assert.equal(h.dispatchCount(), 1);
+  h.action(id, lease, 'progress', {progress: {completed: 0}});
+  h.advance(6 * 60000);
+  assert.equal(h.context.uiRequest('/api/state').value.job.state, 'interrupted');
+});
+test('startup failure records the actual cause and preserves the last snapshot', () => {
+  for (const claimed of [false, true]) {
+    const h = harness(), {id} = h.start(), pointer = h.props.get('CURRENT_MANIFEST_ID');
+    if (claimed) h.claim(id);
+    const result = h.post({action: 'startup_fail', job_id: id, execution: '100:1', code: 'INVALID_JSON'});
+    assert.equal(result.ok, true);
+    const job = h.context.uiRequest('/api/job', {id}).value;
+    assert.equal(job.state, 'failed'); assert.match(job.message, /INVALID_JSON/);
+    assert.match(job.logs.at(-1).text, /시작하지 않았/);
+    assert.equal(h.props.get('CURRENT_MANIFEST_ID'), pointer);
+    assert.equal(h.props.has('ACTIVE_JOB_ID'), false);
+  }
+});
+test('startup reports cannot terminate another execution or a collecting job', () => {
+  const h = harness(), {id} = h.start(), lease = h.claim(id).value.lease;
+  assert.equal(h.post({action: 'startup_fail', job_id: id, execution: '101:1'}).code, 'INVALID_EXECUTION');
+  h.action(id, lease, 'progress', {progress: {completed: 1}});
+  assert.equal(h.post({action: 'startup_fail', job_id: id, execution: '100:1'}).code, 'JOB_NOT_ACTIVE');
+  assert.equal(h.context.findJob_(id).state, 'running');
+});
+test('timer detects a failed unclaimed runner without opening the web app', () => {
+  const h = harness(); h.setClock('2026-10-14T09:00:00+09:00');
+  const {id} = h.start(), pointer = h.props.get('CURRENT_MANIFEST_ID');
+  h.githubRun({id: 123, display_title: 'Camping job ' + id, status: 'completed', conclusion: 'failure'});
+  h.context.scheduledDailyCollection_(); assert.equal(h.monitorReads(), 0);
+  h.advance(120000); h.context.scheduledDailyCollection_();
+  assert.equal(h.monitorReads(), 1);
+  assert.equal(h.context.findJob_(id).state, 'failed');
+  assert.match(h.context.findJob_(id).message, /GITHUB_FAILURE/);
+  assert.equal(h.props.get('CURRENT_MANIFEST_ID'), pointer);
+  assert.equal(h.dispatchCount(), 1);
+});
+test('monitor keeps running jobs and cannot match another queued job', () => {
+  const h = harness(), {id} = h.start();
+  h.githubRun({id: 123, display_title: 'Camping job ' + requestId(), status: 'completed', conclusion: 'failure'});
+  h.context.monitorActiveJob_(); assert.equal(h.context.findJob_(id).state, 'queued');
+  h.githubRun({id: 100, display_title: 'Camping job ' + id, status: 'in_progress', conclusion: null});
+  h.claim(id); h.context.monitorActiveJob_();
+  assert.equal(h.context.findJob_(id).state, 'running');
+});
+test('monitor service errors never mark a live job failed', () => {
+  const h = harness(), {id} = h.start(); h.monitorCode(403);
+  h.context.monitorActiveJob_(); assert.equal(h.context.findJob_(id).state, 'queued');
+});
+test('monitor respects stop and published snapshots even if GitHub failed afterward', () => {
+  const h = harness(), {id} = h.start(), lease = h.claim(id).value.lease;
+  const old = h.context.findJob_(id);
+  h.action(id, lease, 'commit', commitPayload(h)); h.context.saveJob_(old); h.props.set('ACTIVE_JOB_ID', id);
+  h.githubRun({id: 100, status: 'completed', conclusion: 'failure'});
+  const pointer = h.props.get('CURRENT_MANIFEST_ID');
+  h.context.monitorActiveJob_();
+  assert.equal(h.context.findJob_(id).state, 'issues');
+  assert.equal(h.props.get('CURRENT_MANIFEST_ID'), pointer);
+  assert.equal(h.props.has('ACTIVE_JOB_ID'), false);
 });
 test('confirmed review dispatches one authenticated combined job', () => {
   const h = harness(), id = requestId();

@@ -119,6 +119,12 @@ function publicJob_(job) {
     normal: job.normal || 0, issues: job.issues || 0, logs: job.logs || [],
     response: job.response || null};
 }
+function failJob_(job, message, finishedAt) {
+  Object.assign(job, {state: 'failed', message: message.slice(0, 600), finished_at: finishedAt || iso_()});
+  job.logs = (job.logs || []).concat([{time: job.finished_at, text: job.message}]).slice(-150);
+  saveJob_(job);
+  if (props_().getProperty('ACTIVE_JOB_ID') === job.id) props_().deleteProperty('ACTIVE_JOB_ID');
+}
 function recoverJob_(job) {
   if (!job || TERMINAL.includes(job.state)) return job;
   const manifest = current_();
@@ -130,8 +136,11 @@ function recoverJob_(job) {
     return job;
   }
   const age = Date.now() - Date.parse(job.heartbeat || job.started_at);
-  if (age > (job.state === 'queued' ? 25 * 60 * 1000 : 5 * 60 * 1000)) {
-    Object.assign(job, {state: 'interrupted', message: '클라우드 작업 응답이 끊겼습니다. 마지막 저장 결과는 유지됩니다.', finished_at: iso_()});
+  const startup = job.startup_recovery && !job.worker_started;
+  if (age > (job.state === 'queued' ? 25 : startup ? 15 : 5) * 60 * 1000) {
+    const message = (job.worker_started ? '수집 중 클라우드 연결이 끊겼습니다.' : '수집 시작 전 클라우드 연결 대기 시간을 초과했습니다.') + ' 마지막 저장 결과는 유지됩니다.';
+    Object.assign(job, {state: 'interrupted', message: message, finished_at: iso_()});
+    job.logs = (job.logs || []).concat([{time: job.finished_at, text: message}]).slice(-150);
     saveJob_(job);
   }
   return job;
@@ -174,7 +183,7 @@ function state_(knownManifest, knownJobs) {
   state.job.remote_log = !!state.job.id;
   state.busy = !!job && !TERMINAL.includes(job.state);
   state.cloud = true;
-  state.version = '2.5.1';
+  state.version = '2.5.2';
   state.folder = 'Google Drive';
   state.today = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd');
   state.drive_url = 'https://drive.google.com/drive/folders/' + setting_('ROOT_FOLDER_ID');
@@ -253,6 +262,7 @@ function dispatch_(kind, payload, requestId) {
     base_manifest: setting_('CURRENT_MANIFEST_ID'), total: 0, completed: 0, nonces: [], stopRequested: false};
   saveJob_(job);
   props_().setProperty('ACTIVE_JOB_ID', job.id);
+  props_().setProperty('JOB_MONITOR_AFTER', String(Date.now() + 120000));
   const ids = JSON.parse(props_().getProperty('RECENT_JOB_IDS') || '[]');
   props_().setProperty('RECENT_JOB_IDS', JSON.stringify([job.id].concat(ids).slice(0, 30)));
   try {
@@ -291,9 +301,13 @@ function installDailyCollection() {
 function scheduledDailyCollection_() {
   const stamp = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd HH');
   const date = stamp.slice(0, 10), hour = Number(stamp.slice(11));
-  if (hour < 22 || props_().getProperty('DAILY_COLLECTION_DATE') === date) return;
+  const needsDispatch = hour >= 22 && props_().getProperty('DAILY_COLLECTION_DATE') !== date;
+  const needsMonitor = props_().getProperty('ACTIVE_JOB_ID') && Date.now() >= Number(props_().getProperty('JOB_MONITOR_AFTER') || 0);
+  if (!needsDispatch && !needsMonitor) return;
   const email = Session.getEffectiveUser().getEmail().toLowerCase();
   if (!email || email !== setting_('OWNER_EMAIL').toLowerCase()) throw new Error('자동 집계는 소유자 계정에서 설정해야 합니다.');
+  if (needsMonitor) monitorActiveJob_();
+  if (!needsDispatch) return;
   return locked_(() => {
     if (props_().getProperty('DAILY_COLLECTION_DATE') === date) return;
     // Stable job identity also prevents duplicates after a timeout or a partial write.
@@ -310,6 +324,46 @@ function scheduledDailyCollection_() {
     const result = dispatch_('collect', {kind: 'collect', date: date, all: true, revision: state.revision}, id);
     props_().setProperty('DAILY_COLLECTION_DATE', date);
     return result;
+  });
+}
+
+// Runs on the existing timer, including when the owner's browser and PC are closed.
+function monitorActiveJob_() {
+  const snapshot = locked_(() => {
+    props_().setProperty('JOB_MONITOR_AFTER', String(Date.now() + 120000));
+    const id = props_().getProperty('ACTIVE_JOB_ID');
+    return id ? findJob_(id) : null;
+  });
+  if (!snapshot || TERMINAL.includes(snapshot.state)) return;
+  let run = null;
+  try {
+    const repo = setting_('GH_REPO');
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) throw new Error('Invalid repository');
+    const runId = /^[0-9]+:[0-9]+$/.test(snapshot.execution || '') ? snapshot.execution.split(':')[0] : null;
+    const path = runId ? '/actions/runs/' + runId : '/actions/workflows/collect.yml/runs?event=workflow_dispatch&per_page=30';
+    const response = UrlFetchApp.fetch('https://api.github.com/repos/' + repo + path, {
+      muteHttpExceptions: true,
+      headers: {Authorization: 'Bearer ' + setting_('GH_TOKEN'), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}
+    });
+    if (response.getResponseCode() === 200) {
+      const value = JSON.parse(response.getContentText());
+      run = runId ? value : (value.workflow_runs || []).find(r => r.display_title === 'Camping job ' + snapshot.id);
+      if (run && (!Number.isSafeInteger(run.id) || (runId && String(run.id) !== runId))) run = null;
+    }
+  } catch (_) { console.error(JSON.stringify({event: 'job_monitor_unavailable'})); }
+  return locked_(() => {
+    if (props_().getProperty('ACTIVE_JOB_ID') !== snapshot.id) return;
+    const job = findJob_(snapshot.id);
+    if (!job || TERMINAL.includes(job.state) || job.execution !== snapshot.execution) return;
+    // A published snapshot takes precedence over a runner/network failure.
+    if (current_().job_id === job.id) { active_(); return; }
+    if (run && run.status === 'completed') {
+      const stage = job.worker_started ? '수집 또는 저장 중' : '수집 시작 전 연결 단계';
+      const outcome = ['failure', 'cancelled', 'timed_out', 'success'].includes(run.conclusion) ? run.conclusion : 'unknown';
+      failJob_(job, stage + '에서 실행이 종료되었습니다. 마지막 저장 결과는 유지됩니다. [GITHUB_' + outcome.toUpperCase() + '; 실행 ' + run.id + ']');
+      return;
+    }
+    active_();
   });
 }
 
@@ -374,6 +428,19 @@ function worker_(payload, nonce, context) {
   job.nonces = job.nonces.concat([nonce]).slice(-512);
   context.stage = 'save_nonce';
   saveJob_(job);
+  if (payload.action === 'startup_fail') {
+    if (!/^[0-9]+:[0-9]+$/.test(payload.execution || '') || (job.execution && job.execution !== payload.execution))
+      throw bridgeError_('INVALID_EXECUTION', '수집기 실행번호가 일치하지 않습니다.');
+    if (TERMINAL.includes(job.state)) return {recorded: true};
+    if (job.worker_started || props_().getProperty('ACTIVE_JOB_ID') !== job.id)
+      throw bridgeError_('JOB_NOT_ACTIVE', '초기 연결 실패를 기록할 수 없는 작업입니다.');
+    const allowed = ['INVALID_JSON', 'RESPONSE_URL_EXPIRED', 'TIMEOUT', 'NETWORK_ERROR', 'CONNECTION_RESET',
+      'SERVICE_TEMPORARY', 'BUSY', 'AUTH_REJECTED', 'HTTP_401', 'HTTP_403', 'TLS_ERROR'];
+    const code = allowed.includes(payload.code) ? payload.code : 'CONNECTION_ERROR';
+    job.execution = payload.execution;
+    failJob_(job, '수집 시작 전 Google 연결 복구에 실패했습니다. 객실 수집은 시작하지 않았으며 이전 자료를 유지합니다. [' + code + '; claim]');
+    return {recorded: true};
+  }
   if (payload.action === 'claim') {
     if (TERMINAL.includes(job.state)) return {terminal: true};
     if (props_().getProperty('ACTIVE_JOB_ID') !== job.id) throw bridgeError_('JOB_NOT_ACTIVE', '현재 실행 중인 작업이 아닙니다.');
@@ -383,8 +450,10 @@ function worker_(payload, nonce, context) {
       Object.assign(job, {state: 'running', execution: payload.execution,
         lease: Utilities.getUuid() + Utilities.getUuid(), heartbeat: iso_(), message: '클라우드 수집기 연결됨'});
       context.stage = 'save_claim';
-      saveJob_(job);
     }
+    job.startup_recovery = payload.startup_recovery === true;
+    job.heartbeat = iso_();
+    saveJob_(job);
     context.stage = 'read_bundle';
     const manifest = json_(job.base_manifest);
     const bundle = DriveApp.getFileById(manifest.bundle_id).getBlob().getBytes();
@@ -395,15 +464,14 @@ function worker_(payload, nonce, context) {
   if (TERMINAL.includes(job.state) || props_().getProperty('ACTIVE_JOB_ID') !== job.id) throw bridgeError_('JOB_NOT_ACTIVE', '종료되거나 중단된 작업입니다. 화면에서 새 작업을 시작해 주세요.');
   if (payload.action === 'progress') {
     context.stage = 'save_progress';
+    job.worker_started = true;
     progress_(job, payload.progress || {});
     saveJob_(job);
     return {stopRequested: job.stopRequested};
   }
   if (payload.action === 'fail') {
     context.stage = 'save_failure';
-    Object.assign(job, {state: 'failed', message: String(payload.message || '수집 실패').slice(0, 600), finished_at: iso_()});
-    saveJob_(job);
-    props_().deleteProperty('ACTIVE_JOB_ID');
+    failJob_(job, String(payload.message || '수집 실패'));
     return {recorded: true};
   }
   if (payload.action !== 'commit') throw bridgeError_('INVALID_ACTION', '지원하지 않는 수집기 요청입니다.');
