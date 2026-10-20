@@ -37,7 +37,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 
-VERSION = "2.6.2"
+VERSION = "2.6.3"
 
 
 class Manager:

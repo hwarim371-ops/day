@@ -20,11 +20,20 @@ def snapshot(*items, stable=True):
 
 class Changes(unittest.TestCase):
     def test_promotion_on_a_real_room_is_not_coupon(self):
-        for name in ["여름특가 A-1", "[쿠폰 할인] 글램핑 1", "이벤트 카라반 2호"]:
+        for name in ["여름특가 A-1", "[쿠폰 할인] 글램핑 1", "이벤트 카라반 2호", "당일특가 A-1"]:
             self.assertEqual(classify(card(name))[0], "room")
         self.assertEqual(classify(card("글램핑 할인 이벤트"))[0], "review")
         for name in ["할인쿠폰 받기", "이벤트", "더보기", "상세보기"]:
             self.assertEqual(classify(card(name))[0], "excluded")
+
+    def test_day_use_with_coupon_words_is_excluded_before_promotion_review(self):
+        for name in ["평일 당일치기 글램핑(숙박 불가 상품/쿠폰 사용 불가)",
+                     "휴일 당일치기 글램핑(숙박 불가 상품/쿠폰 사용 불가)"]:
+            self.assertEqual(classify(card(name))[0], "excluded")
+
+    def test_standalone_shower_is_not_campsite_with_shower(self):
+        self.assertEqual(classify(card("단독사용 개별샤워실"))[0], "excluded")
+        self.assertEqual(classify(card("개별샤워실 20사이트(8미터10미터)"))[0], "room")
 
     def test_stable_id_rename_is_not_new_inventory(self):
         old = card("A-1")
