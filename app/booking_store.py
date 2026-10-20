@@ -9,6 +9,7 @@ import re
 import shutil
 from urllib.parse import parse_qs, urlparse
 from dataclasses import asdict
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
@@ -177,8 +178,8 @@ class Store:
                 continue
         return latest
 
-    def apply(self, payload, *, room_rules=None, archive_keys=()):
-        with core.collection_run_lock(self.folder):
+    def apply(self, payload, *, room_rules=None, archive_keys=(), _collection_locked=False):
+        with nullcontext() if _collection_locked else core.collection_run_lock(self.folder):
             entries, rev = self.entries()
             edits = payload.get("edits", [])
             manual_force = (payload.get("force_manual") is True and isinstance(edits, list)

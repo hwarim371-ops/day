@@ -1,7 +1,7 @@
 """Classify sale items, not every piece of text on the room page."""
 import re
 
-PARSER_VERSION = "room-items-3"
+PARSER_VERSION = "room-items-4"
 
 
 def normalize(value):
@@ -22,10 +22,18 @@ def classify(card, rules=None):
         return "review", "상품명 확인 불가"
     if rule.get("mode") == "include":
         return "room", "사용자가 객실로 확인한 상품"
-    if card.get("schemaVersion") == 3 and not card.get("unitEvidence"):
-        return "review", "개별 판매 항목 근거 부족"
-    if re.search(r"공지|필독|이용안내|예약안내|안내사항|이용규칙|이용수칙|유의사항|주의사항|환불규정|배치도|오시는길|문의|상담|쿠폰|프로모션|알림받기|더보기|\*{2,}", key):
+    if re.search(r"공지|필독|이용안내|예약안내|안내사항|이용규칙|이용수칙|유의사항|주의사항|환불규정|배치도|오시는길|문의|상담|알림받기|더보기|\*{2,}", key):
         return "excluded", "공지·안내·문의·혜택 상품"
+    if re.fullmatch(r"예약(?:하기|가능)?|상세보기|펼쳐보기|접기|날짜선택|사진(?:보기)?|리뷰(?:보기)?|공유|찜하기", key):
+        return "excluded", "객실이 아닌 화면 버튼"
+    if re.search(r"쿠폰|프로모션|이벤트|할인|혜택|특가", key):
+        # A promotion on a numbered room is not a separate coupon product.
+        named_unit = re.search(r"(?:사이트|객실|글램핑|카라반|텐트|동|호)\s*[-_]?\s*\d+|[a-z가-힣]+[-_]\d+|\d+\s*(?:번|호|동)(?:\b|$)", title, re.I)
+        if not (named_unit and card.get("unitEvidence") and card.get("overnightEvidence")
+                and str(card.get("itemKey", "")).startswith("product:")):
+            if named_unit or (card.get("overnightEvidence") and re.search(r"사이트|객실|글램핑|카라반|펜션", title)):
+                return "review", "할인 객실인지 독립 혜택 상품인지 확인 필요"
+            return "excluded", "독립 이벤트·쿠폰·혜택 안내"
     if re.search(r"데이유즈|dayuse|당일|캠크닉|피크닉|시간이용|이용권|입장권|오전권|오후권|바베큐장|바비큐장|캠핑식당", key):
         return "excluded", "숙박 객실이 아닌 당일·시간제 이용 상품"
     if re.match(r"^(?:캠핑사이트|글램핑|카라반|펜션|방갈로|객실)?[,，]?(?:기준|최대)\d+인", key):
@@ -35,6 +43,8 @@ def classify(card, rules=None):
     text = str(card.get("text", ""))
     if re.search(r"(?:^|\n)\s*(?:데이유즈|day\s*use)\s*(?:\n|$)|\d+\s*시간\s*이용", text, re.I):
         return "excluded", "시간 단위로 이용하는 비숙박 상품"
+    if card.get("schemaVersion") == 3 and not card.get("unitEvidence"):
+        return "review", "개별 판매 항목 근거 부족"
     if card.get("schemaVersion") == 3 and not card.get("overnightEvidence"):
         return "review", "숙박·캠핑사이트 근거 부족"
     return "room", "개별 객실 상품 확인"

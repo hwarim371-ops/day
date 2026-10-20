@@ -35,8 +35,9 @@ from booking_discovery import search_places, verify_place, place_id
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
+from room_reconcile import exact_bindings, plan_changes, catalog_signature
 
-VERSION = "2.5.1"
+VERSION = "2.6.0"
 
 
 class Manager:
@@ -49,6 +50,7 @@ class Manager:
         self.order_path = self.store.home / "list_order.json"
         self.data = read_json(self.state_path, {"results": {}, "proposals": {}, "discoveries": [], "jobs": []})
         self.data.setdefault("catalogs", {})
+        self.data.setdefault("room_bindings", {})
         self.legacy = self.store.legacy_results()
         self.legacy_stamp = time.monotonic()
         self.job = {"state": "idle", "message": "대기 중", "completed": 0, "total": 0, "logs": []}
@@ -160,6 +162,11 @@ class Manager:
             with self.lock:
                 self.job["state"] = "stopped" if self.stop.is_set() else ("issues" if self.job["issues"] else "completed")
                 self.log(f"{'중지' if self.stop.is_set() else '완료'}: 처리 {self.job['completed']}/{self.job['total']}, 정상 {self.job['normal']}, 확인 필요 {self.job['issues']}")
+                counts = self.job.get("auto_changes", {})
+                if counts:
+                    self.log(self.job["message"] + f" · 자동 DB 수정 {counts.get('entries', 0)}항목"
+                             + f", 이름 추적 {counts.get('renamed', 0)}개, 신규 {counts.get('added', 0)}개"
+                             + f", 비객실 제외 {counts.get('excluded', 0)}개")
         except Exception as exc:
             with self.lock:
                 self.job["state"] = "failed"
@@ -177,14 +184,67 @@ class Manager:
 
     def entry_snapshot(self, entry, snapshot):
         rules = self.rules(entry.company_id)
+        aliases = self.data["room_bindings"].get(entry_key(entry), {})
         if self.manual_rooms(entry):
             # User-confirmed rooms win over all automatic and older product decisions.
             cards = snapshot.get("roomCards", [])
             keys = core.normalized_room_list(entry.rooms)
-            chosen = [core.choose_best_room_card(key, cards, [], keys)[0] for key in keys]
+            chosen = [core.choose_best_room_card(key, cards, [], keys, aliases)[0] for key in keys]
             included = {item_key(card) for card in chosen if card is not None}
             rules = {item_key(card): {"mode": "include" if item_key(card) in included else "exclude"} for card in cards}
-        return {**snapshot, "roomRules": rules}
+        return {**snapshot, "roomRules": rules, "roomAliases": aliases}
+
+    def _reconcile_entry(self, entry, snapshot, previous, collector, confirmed, kind):
+        key = entry_key(entry)
+        rules = self.rules(entry.company_id)
+        bindings = exact_bindings(entry.rooms, previous.get("roomCards", []), rules,
+                                  self.data["room_bindings"].get(key))
+        bindings = exact_bindings(entry.rooms, snapshot.get("roomCards", []), rules, bindings)
+        self.data["room_bindings"][key] = bindings
+        split = sum(e.company_id == entry.company_id and entry_key(e) not in self.store.meta["archived"]
+                    for e in self.store.entries()[0]) > 1
+
+        def inspect(current):
+            scoped = self.entry_snapshot(entry, current) if self.manual_rooms(entry) else current
+            return plan_changes(entry.rooms, scoped, scoped.get("roomRules", rules), bindings,
+                                manual=self.manual_rooms(entry), split=split)
+
+        plan = inspect(snapshot)
+        verification = False
+        if kind == "collect" and (plan["changed"] or plan["missing"]) and entry.company_id not in confirmed:
+            refresh = getattr(collector, "refresh_snapshot", None)
+            if refresh and not self.stop.is_set():
+                self.log(f"{entry.sheet_title}: 변경 원인 재확인 중")
+                before = catalog_signature(snapshot)
+                _, snapshot = refresh(entry.company_id)
+                verification = (before == catalog_signature(snapshot)
+                                and snapshot.get("listingStable") is True)
+                confirmed[entry.company_id] = verification
+                plan = inspect(snapshot)
+        elif entry.company_id in confirmed:
+            verification = confirmed[entry.company_id]
+        if self.stop.is_set():
+            plan["changed"] = False
+        applied = False
+        if kind == "collect" and plan["changed"] and verification:
+            try:
+                self.store.apply({"revision": self.store.entries()[1],
+                    "edits": [{"key": key, "rooms_only": True, "rooms": plan["rooms"]}]},
+                    _collection_locked=True)
+                entry = next(e for e in self.store.entries()[0] if entry_key(e) == key)
+                self.data["room_bindings"][key] = plan["bindings"]
+                applied = True
+                self.log(f"{entry.sheet_title}: 백업 후 자동 반영 · {plan['summary']}")
+            except (ValueError, PermissionError) as exc:
+                plan["summary"] += " / 자동 변경 보류: " + str(exc)
+        elif plan["changed"]:
+            plan["summary"] += " / 변경 후보 재확인 필요 · DB 유지"
+        plan["applied"] = applied
+        counts = self.job.setdefault("auto_changes", {"entries": 0, "renamed": 0, "added": 0, "excluded": 0})
+        counts["entries"] += int(applied)
+        counts["renamed"] += len(plan["renamed"])
+        counts["added"] += len(plan["added"]) if applied else 0
+        return entry, snapshot, plan
 
     def _proposal(self, entry, snapshot, revision):
         snapshot = self.entry_snapshot(entry, snapshot)
@@ -196,7 +256,8 @@ class Manager:
         for member in group:
             keys = core.normalized_room_list(member.rooms)
             for room in member.rooms:
-                card, _ = core.choose_best_room_card(core.normalize_name(room), filtered["roomCards"], [], keys)
+                card, _ = core.choose_best_room_card(core.normalize_name(room), filtered["roomCards"], [], keys,
+                                                    self.data["room_bindings"].get(entry_key(member)))
                 if card is not None:
                     matched_titles.add(core.normalize_name(card.get("title")))
                 elif member.excel_row == entry.excel_row:
@@ -218,6 +279,9 @@ class Manager:
         collected_normal = []
         attempted_keys = []
         results = []
+        previous_catalogs = copy.deepcopy(self.data["catalogs"])
+        confirmed, reported_companies = {}, set()
+        self.log(f"객실 변경 자동 판별 v{VERSION} · 객실명/비객실 구분 · 변경 업체만 1회 재확인")
         if kind == "collect":
             if self.store.result.exists():
                 shutil.copy2(self.store.result, self.store.home / ("현황_수집전_" + self.job["id"] + ".xlsx"))
@@ -233,16 +297,25 @@ class Manager:
                     key = entry_key(e)
                     try:
                         url, snapshot = collector.get_snapshot(e.company_id)
+                        previous = previous_catalogs.get(e.company_id, {}).get("snapshot", {})
+                        e, snapshot, changes = self._reconcile_entry(e, snapshot, previous, collector, confirmed, kind)
+                        rev = self.store.entries()[1]
+                        if e.company_id not in reported_companies:
+                            self.job["auto_changes"]["excluded"] += len(partition(snapshot, self.rules(e.company_id))["excluded"])
+                            reported_companies.add(e.company_id)
                         with self.lock:
                             self.data["catalogs"][e.company_id] = {"snapshot": {"roomCards": snapshot.get("roomCards", []), "strictRoomCards": True}, "checked_at": now()}
                         proposal = self._proposal(e, snapshot, rev)
+                        proposal["diagnosis"] = changes
                         snapshot = self.entry_snapshot(e, snapshot)
                         result = core.analyze_entry_snapshot(e, snapshot, words, "matched", url)
                         if self.manual_rooms(e) and result.missing_count:
                             result.status = f"수동 목록 저장됨 · 화면에서 확인 못한 객실 {result.missing_count}개"
+                        if result.missing_count:
+                            result.status += " · " + changes["summary"]
                         filtered, _ = filtered_snapshot(snapshot, snapshot["roomRules"])
                         room_keys = core.normalized_room_list(e.rooms)
-                        matches = [core.choose_best_room_card(k, filtered["roomCards"], words, room_keys)[0] for k in room_keys]
+                        matches = [core.choose_best_room_card(k, filtered["roomCards"], words, room_keys, snapshot.get("roomAliases"))[0] for k in room_keys]
                         matched_ids = [item_key(card) for card in matches if card is not None]
                         if len(matched_ids) != len(set(matched_ids)):
                             result.status = "같은 화면 상품에 여러 객실명이 매칭됨 · 중복 집계 확인 필요"
@@ -254,6 +327,14 @@ class Manager:
                                  and entry_key(v) not in self.store.meta["archived"]]
                         if any(set(core.normalized_room_list(e.rooms)) & set(core.normalized_room_list(v.rooms)) for v in group):
                             result.status = "분류 간 객실 중복: 가동률 중복 집계 주의"
+                        for other in group:
+                            other_snapshot = self.entry_snapshot(other, snapshot)
+                            other_filtered, _ = filtered_snapshot(other_snapshot, other_snapshot["roomRules"])
+                            other_keys = core.normalized_room_list(other.rooms)
+                            other_cards = [core.choose_best_room_card(k, other_filtered["roomCards"], words,
+                                other_keys, other_snapshot.get("roomAliases"))[0] for k in other_keys]
+                            if set(matched_ids) & {item_key(c) for c in other_cards if c is not None}:
+                                result.status = "분류 간 동일 상품 중복: 객실 배정 확인 필요"
                         with self.lock:
                             self.data["proposals"][key] = proposal
                             if kind == "collect":
@@ -263,7 +344,8 @@ class Manager:
                                     "reserved_rooms": result.reserved_rooms, "missing_rooms": result.missing_rooms,
                                     "checked_at": now(), "date": checkin.isoformat(), "fingerprint": fingerprint(e),
                                     "parser_version": PARSER_VERSION, "rules_revision": self.rules_revision(e.company_id),
-                                    "excluded_items": proposal["excluded"], "review_items": proposal["review"]}
+                                    "excluded_items": proposal["excluded"], "review_items": proposal["review"],
+                                    "diagnosis": changes}
                                 attempted_keys.append(key)
                             self.job["completed"] += 1
                             self.job["normal" if result.status == "정상" else "issues"] += 1
@@ -277,6 +359,8 @@ class Manager:
                                     ws.cell(row, 6).value = result.reserved_count * amount if amount is not None else None
                         results.append(result)
                         self.log(f"{self.job['completed']}/{len(entries)} {e.major} / {e.sheet_title}: 마감 {result.reserved_count}/{result.saved_total}, 매칭 {result.matched_count}/{len(e.rooms)} · {result.status}")
+                        if changes["summary"] != "객실 구성 동일":
+                            self.log(f"{e.sheet_title}: {changes['summary']}")
                     except Exception as exc:
                         with self.lock:
                             self.job["completed"] += 1
@@ -306,6 +390,8 @@ class Manager:
                 # A completed attempt is different from a successful match. Keep errors visible,
                 # but never ask the user to save the same DB edit again.
                 self.store.meta["changed"] = [k for k in self.store.meta["changed"] if k not in attempted_keys]
+                for key in attempted_keys:
+                    self.data["proposals"][key]["revision"] = self.store.entries()[1]
                 if results and kind == "collect":
                     core.write_run_log(self.store.backup / ("booking_run_" + self.job["id"] + ".csv"), results)
                 self.store.save_meta()

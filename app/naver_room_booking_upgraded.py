@@ -953,6 +953,8 @@ EXTRACT_SCRIPT = r"""
       if (productIds.length > 1) continue;
       const productKey = productIds[0] ? 'product:' + productIds[0] : 'name:' + titleKey.toLowerCase();
       const statuses = Array.from(el.querySelectorAll('*')).filter(n=>!n.children.length).map(textOf).filter(t=>statusKeys.includes(normalize(t)));
+      const prices = [...new Set(text.split('\n').map(t => t.trim()).filter(t => /^[\d,]+\s*원$/.test(t))
+        .map(t => Number(t.replace(/\D/g, ''))).filter(n => n > 0))];
       const firstLine = text.split('\n').map(s=>s.trim()).find(Boolean) || '';
       if (statusKeys.includes(normalize(firstLine))) statuses.push(firstLine);
       if (title && !seenRooms.has(productKey)) {
@@ -963,6 +965,7 @@ EXTRACT_SCRIPT = r"""
           itemUrl: links[0] ? links[0].href : '',
           unitEvidence: true,
           overnightEvidence: /최소\s*\d+\s*박|\d+\s*박|침실|침대|캠핑사이트|파쇄석|일반노지|글램핑|카라반/.test(text),
+          priceAmount: prices.length === 1 ? prices[0] : null,
           statusLabels: [...new Set(statuses)],
           title,
           titleKey,
@@ -989,6 +992,9 @@ EXTRACT_SCRIPT = r"""
     roomCards,
     roomEvidenceFiltered: true,
     strictRoomCards: true,
+    pendingListing: Array.from(document.querySelectorAll("[aria-busy='true'],button,a")).some(el =>
+      isVisible(el) && (el.getAttribute("aria-busy") === "true" ||
+      /^(?:객실|상품|사이트|숙소)\s*(?:더보기|더\s*보기|더\s*불러오기)$/.test(textOf(el)))),
     statusOccurrences: statusKeys.reduce((sum, status) => {
       return sum + (bodyKey.split(status).length - 1);
     }, 0),
@@ -1085,14 +1091,19 @@ class BrowserCollector:
         except self._timeout_error:
             pass
         self._page.wait_for_timeout(2000)
-        self._scroll_to_bottom()
+        listing_stable = self._scroll_to_bottom()
         snapshot = self._page.evaluate(EXTRACT_SCRIPT, {"statusKeys": self.status_words})
+        snapshot["listingStable"] = bool(listing_stable and not snapshot.get("pendingListing"))
         self._snapshots[company_id] = snapshot
         return url, snapshot
 
-    def _scroll_to_bottom(self) -> None:
+    def refresh_snapshot(self, company_id: str) -> tuple[str, dict]:
+        self._snapshots.pop(company_id, None)
+        return self.get_snapshot(company_id)
+
+    def _scroll_to_bottom(self) -> bool:
         if not self._page:
-            return
+            return False
         last_height = 0
         stable_count = 0
         for _ in range(12):
@@ -1101,14 +1112,15 @@ class BrowserCollector:
                 self._page.evaluate("window.scrollTo(0, document.body ? document.body.scrollHeight : 0)")
                 self._page.wait_for_timeout(1200)
             except Exception:
-                break
+                return False
             if new_height == last_height:
                 stable_count += 1
                 if stable_count >= 2:
-                    break
+                    return True
             else:
                 stable_count = 0
                 last_height = new_height
+        return False
 
 
 def room_key_positions(text_key: str, room_key: str) -> list[int]:
@@ -1244,7 +1256,15 @@ def choose_best_room_card(
     room_cards: list[dict],
     status_words: list[str],
     room_keys: list[str],
+    aliases: dict | None = None,
 ) -> tuple[dict | None, bool]:
+    identity = (aliases or {}).get(room_key.casefold())
+    if identity:
+        identified = [c for c in room_cards if c.get("itemKey") == identity]
+        if len(identified) == 1:
+            card = identified[0]
+            reserved = any(normalize_name(label) in status_words for label in card.get("statusLabels", []))
+            return card, reserved
     scored = []
     for card in room_cards:
         title_key = card.get("titleKey") or normalize_name(card.get("title"))
@@ -1376,7 +1396,7 @@ def analyze_entry_snapshot(entry: DbEntry, snapshot: dict, status_words: list[st
 
     for room in entry.rooms:
         room_key = normalize_name(room)
-        card, reserved = choose_best_room_card(room_key, room_cards, status_words, room_keys)
+        card, reserved = choose_best_room_card(room_key, room_cards, status_words, room_keys, snapshot.get("roomAliases"))
         if card:
             evidence = " ".join((card.get("text") or card.get("title") or "").split())
             matches.append(RoomMatch(room, True, reserved, evidence[:300]))
