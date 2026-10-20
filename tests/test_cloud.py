@@ -17,7 +17,7 @@ import booking_file_lock
 import naver_room_booking_upgraded as core
 from cloud.snapshot import digest, pack, unpack, FILES
 from cloud.runner import Bridge, envelope, execute, run
-from cloud.build import web_html
+from cloud.build import APP_FILES, web_html
 
 JOB = '9d5db4ef-5c77-4e4c-a461-165c239545ec'
 
@@ -37,6 +37,7 @@ class CloudTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[1] / "cloud/workflows/collect.yml").read_text(encoding="utf-8")
         self.assertIn("runs-on: ubuntu-24.04", workflow)
         self.assertNotIn("runs-on: ubuntu-latest", workflow)
+        self.assertIn("room_reconcile.py", APP_FILES)
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
