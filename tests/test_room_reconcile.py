@@ -178,6 +178,16 @@ class Integration(unittest.TestCase):
         self.assertEqual(self.collect(m, e, snapshot(card("A-1", "1"), card("A-2", "2"))), 0)
         self.assertEqual(m.job["normal"], 1)
 
+    def test_existing_sibling_rooms_are_not_reported_as_new(self):
+        m = manager.Manager(self.folder)
+        e = m.store.entries()[0][0]
+        s = snapshot(card("A-1", "1"), card("A-2", "2"), card("G-1", "3"), card("G-2", "4"))
+        self.collect(m, e, s)
+        result = m.data["results"][entry_key(e)]
+        self.assertEqual(result["diagnosis"]["uncertain_new"], [])
+        self.assertEqual(result["diagnosis"]["summary"], "객실 구성 동일")
+        self.assertEqual(m.job["normal"], 1)
+
     def test_manual_rename_is_collected_without_rewriting_user_names(self):
         m = manager.Manager(self.folder)
         e = m.store.entries()[0][0]

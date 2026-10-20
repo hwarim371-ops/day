@@ -31,7 +31,7 @@ def exact_bindings(rooms, cards, rules, saved=None):
     return bindings
 
 
-def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False):
+def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False, other_item_keys=()):
     groups = partition(snapshot, rules)
     raw = snapshot.get("roomCards", [])
     counts = Counter(stable_id(c) for c in raw)
@@ -67,7 +67,7 @@ def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False)
         else:
             next_rooms.append(name)
             missing.append(name)
-    added = [c for c in groups["room"] if item_key(c) not in used]
+    added = [c for c in groups["room"] if item_key(c) not in used and item_key(c) not in other_item_keys]
     numbered = [family(c["title"]) for c in matched]
     common = numbered[0] if numbered and all(f == numbered[0] for f in numbered) else None
     prices = [c.get("priceAmount") for c in matched]

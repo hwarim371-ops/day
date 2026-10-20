@@ -37,7 +37,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 
 class Manager:
@@ -202,13 +202,24 @@ class Manager:
                                   self.data["room_bindings"].get(key))
         bindings = exact_bindings(entry.rooms, snapshot.get("roomCards", []), rules, bindings)
         self.data["room_bindings"][key] = bindings
-        split = sum(e.company_id == entry.company_id and entry_key(e) not in self.store.meta["archived"]
-                    for e in self.store.entries()[0]) > 1
+        peers = [e for e in self.store.entries()[0] if e.company_id == entry.company_id
+                 and entry_key(e) != key and entry_key(e) not in self.store.meta["archived"]]
 
         def inspect(current):
             scoped = self.entry_snapshot(entry, current) if self.manual_rooms(entry) else current
+            other_ids = set()
+            for peer in peers:
+                old_rules = self.entry_snapshot(peer, previous)["roomRules"] if self.manual_rooms(peer) else rules
+                peer_aliases = exact_bindings(peer.rooms, previous.get("roomCards", []), old_rules,
+                                             self.data["room_bindings"].get(entry_key(peer)))
+                peer_cards = current.get("roomCards", []) if self.manual_rooms(peer) else partition(current, rules)["room"]
+                peer_keys = core.normalized_room_list(peer.rooms)
+                for name in peer_keys:
+                    card, _ = core.choose_best_room_card(name, peer_cards, [], peer_keys, peer_aliases)
+                    if card is not None:
+                        other_ids.add(item_key(card))
             return plan_changes(entry.rooms, scoped, scoped.get("roomRules", rules), bindings,
-                                manual=self.manual_rooms(entry), split=split)
+                                manual=self.manual_rooms(entry), split=bool(peers), other_item_keys=other_ids)
 
         plan = inspect(snapshot)
         verification = False
