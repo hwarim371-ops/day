@@ -96,6 +96,11 @@ class Changes(unittest.TestCase):
         result = core.analyze_entry_snapshot(e, snapshot(*items), core.normalize_words(core.DEFAULT_STATUS_WORDS), "matched", "")
         self.assertEqual((result.matched_count, result.reserved_count, result.saved_total), (8, 4, 8))
 
+    def test_user_exclusion_does_not_claim_a_real_room_is_a_notice(self):
+        p = plan_changes(["A-1"], snapshot(card("A-1", "1"), card("글램핑 1", "2")), {"product:2": {"mode": "exclude"}}, {})
+        self.assertNotIn("공지·혜택·비숙박", p["summary"])
+        self.assertEqual(p["selected_exclusions"], 1)
+
 
 class Integration(unittest.TestCase):
     setUp = fixtures.Tests.setUp
@@ -177,6 +182,7 @@ class Integration(unittest.TestCase):
         m = manager.Manager(self.folder)
         e = m.store.entries()[0][0]
         m.store.meta["manual_rooms"] = {entry_key(e): {"rooms": list(e.rooms)}}
+        m.store.meta["room_rules"] = {e.company_id: {"product:1": {"mode": "exclude"}}}
         m.data["catalogs"][e.company_id] = {"snapshot": snapshot(card("A-1", "1"), card("A-2", "2"))}
         before = m.store.db.read_bytes()
         self.collect(m, e, snapshot(card("숲속-1", "1", ["예약마감"]), card("A-2", "2")))

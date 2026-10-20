@@ -86,6 +86,8 @@ def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False)
         next_rooms = list(rooms)
         accepted = []
     uncertain_new = [c["title"] for c in added if c not in accepted] if not manual else []
+    automatic_exclusions = [c for c in groups["excluded"] if c["mode"] != "exclude"]
+    selected_exclusions = [c for c in groups["excluded"] if c["mode"] == "exclude"]
     reasons = []
     if renamed:
         reasons.append(f"객실명 변경 {len(renamed)}개" + (" · 직접 지정한 이름 유지" if manual else ""))
@@ -93,8 +95,10 @@ def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False)
         reasons.append(f"동일 유형 신규 객실 {len(accepted)}개")
     if noise:
         reasons.append(f"DB 비객실 후보 {len(noise)}개")
-    if groups["excluded"]:
-        reasons.append(f"공지·혜택·비숙박 {len(groups['excluded'])}개 제외")
+    if automatic_exclusions:
+        reasons.append(f"공지·혜택·비숙박 {len(automatic_exclusions)}개 제외")
+    if selected_exclusions:
+        reasons.append(f"지정 목록 밖·사용자 제외 {len(selected_exclusions)}개")
     if missing:
         label = "수집 화면 불완전" if snapshot.get("listingStable") is False or not raw else "이름·판매 여부 확인"
         reasons.append(f"{label} {len(missing)}개 · DB 유지")
@@ -105,6 +109,7 @@ def plan_changes(rooms, snapshot, rules, bindings, *, manual=False, split=False)
     return {"rooms": next_rooms, "renamed": renamed, "added": [c["title"] for c in accepted],
             "excluded_db": noise, "missing": missing, "uncertain_new": uncertain_new,
             "excluded_count": len(groups["excluded"]), "review_count": len(groups["review"]),
+            "automatic_exclusions": len(automatic_exclusions), "selected_exclusions": len(selected_exclusions),
             "summary": " / ".join(reasons) or "객실 구성 동일", "manual": manual,
             "changed": next_rooms != rooms, "bindings": exact_bindings(next_rooms, raw, rules, bindings)}
 

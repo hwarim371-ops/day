@@ -37,7 +37,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 
 class Manager:
@@ -166,7 +166,7 @@ class Manager:
                 if counts:
                     self.log(self.job["message"] + f" · 자동 DB 수정 {counts.get('entries', 0)}항목"
                              + f", 이름 추적 {counts.get('renamed', 0)}개, 신규 {counts.get('added', 0)}개"
-                             + f", 비객실 제외 {counts.get('excluded', 0)}개")
+                             + f", 집계 대상 제외 {counts.get('excluded', 0)}개")
         except Exception as exc:
             with self.lock:
                 self.job["state"] = "failed"
@@ -197,7 +197,8 @@ class Manager:
     def _reconcile_entry(self, entry, snapshot, previous, collector, confirmed, kind):
         key = entry_key(entry)
         rules = self.rules(entry.company_id)
-        bindings = exact_bindings(entry.rooms, previous.get("roomCards", []), rules,
+        previous_rules = self.entry_snapshot(entry, previous)["roomRules"] if self.manual_rooms(entry) else rules
+        bindings = exact_bindings(entry.rooms, previous.get("roomCards", []), previous_rules,
                                   self.data["room_bindings"].get(key))
         bindings = exact_bindings(entry.rooms, snapshot.get("roomCards", []), rules, bindings)
         self.data["room_bindings"][key] = bindings
