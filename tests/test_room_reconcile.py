@@ -1,5 +1,6 @@
 import copy
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -109,6 +110,70 @@ class Changes(unittest.TestCase):
         p = plan_changes(["A-1"], snapshot(card("A-1", "1"), card("글램핑 1", "2")), {"product:2": {"mode": "exclude"}}, {})
         self.assertNotIn("공지·혜택·비숙박", p["summary"])
         self.assertEqual(p["selected_exclusions"], 1)
+
+    def test_numbered_facility_rename_without_old_product_id(self):
+        old = "개별샤워실 20사이트(8미터10미터)"
+        new = "공용샤워실 20사이트(8미터10미터)"
+        p = plan_changes([old], snapshot(card(new, "20")), {}, {}, automatic=True)
+        self.assertEqual(p["rooms"], [new])
+        self.assertEqual(p["bindings"][new.replace(" ", "").casefold()], "product:20")
+        self.assertEqual(p["uncertain_new"], [])
+        p = plan_changes([old], snapshot(card(new, "20")), {}, {}, automatic=True, manual=True)
+        self.assertEqual(p["rooms"], [old])
+        self.assertTrue(p["identity_changed"])
+
+    def test_different_unit_or_tariff_never_inferred_as_rename(self):
+        for old, new in [
+            ("개별샤워실 20사이트(8미터10미터)", "공용샤워실 21사이트(8미터10미터)"),
+            ("S-5 개별화장실+개별개수대 파쇄석만 이용(노키즈존)", "S-5 독채 + 대형 파쇄석"),
+        ]:
+            p = plan_changes([old], snapshot(card(new)), {}, {}, automatic=True)
+            self.assertEqual(p["renamed"], [])
+
+    def test_ambiguous_same_number_names_not_merged(self):
+        old = "개별샤워실 20사이트(8미터10미터)"
+        names = ["공용샤워실 20사이트(8미터10미터)", "실내샤워실 20사이트(8미터10미터)"]
+        p = plan_changes([old], snapshot(*(card(n, str(i)) for i, n in enumerate(names))), {}, {}, automatic=True)
+        self.assertEqual(p["rooms"], [old])
+
+    def test_small_absence_is_reversible_not_sold_out(self):
+        rooms = [f"A-{i}" for i in range(1, 6)]
+        s = snapshot(*(card(n, str(i)) for i, n in enumerate(rooms[:-1])))
+        p = plan_changes(rooms, s, {}, {}, automatic=True)
+        self.assertEqual(p["rooms"], rooms[:-1])
+        self.assertEqual(p["missing"], [])
+        self.assertEqual(p["inactive"][0]["title"], "A-5")
+        self.assertIn("임시 보관", p["summary"])
+        s["roomCards"].append(card("A-5", "5"))
+        restored = plan_changes(p["rooms"], s, {}, {}, automatic=True, inactive=p["inactive"])
+        self.assertEqual(restored["rooms"], rooms)
+        self.assertEqual(restored["inactive"], [])
+        self.assertEqual(restored["restored"], ["A-5"])
+
+    def test_broken_incomplete_or_large_shrink_cannot_be_normalized(self):
+        rooms = [f"A-{i}" for i in range(1, 6)]
+        for s in [snapshot(), snapshot(card("A-1", "1")),
+                  snapshot(*(card(n, str(i)) for i, n in enumerate(rooms[:-1])), stable=False)]:
+            p = plan_changes(rooms, s, {}, {}, automatic=True)
+            self.assertEqual(p["inactive_new"], [])
+            self.assertEqual(p["rooms"], rooms)
+        old = [{"title": "A-5", "index": 4}]
+        p = plan_changes(rooms[:-1], snapshot(*(card(n, str(i)) for i, n in enumerate(rooms[:3]))),
+                         {}, {}, automatic=True, inactive=old)
+        self.assertEqual(p["inactive_new"], [])
+
+    def test_ambiguous_new_item_prevents_automatic_shrink(self):
+        rooms = ["A-1", "A-2", "A-3", "A-4"]
+        p = plan_changes(rooms, snapshot(card("A-1", "1"), card("A-2", "2"),
+                                        card("A-3", "3"), card("다른 객실", "other")), {}, {}, automatic=True)
+        self.assertEqual(p["rooms"], rooms)
+
+    def test_explicit_exclusion_and_sibling_ownership_prevent_restore(self):
+        old = [{"title": "A-5", "itemKey": "product:5", "index": 0}]
+        s = snapshot(card("A-1", "1"), card("A-5", "5"))
+        for options, rules in [({}, {"product:5": {"mode": "exclude"}}), ({"other_item_keys": {"product:5"}}, {})]:
+            p = plan_changes(["A-1"], s, rules, {}, inactive=old, automatic=True, **options)
+            self.assertEqual(p["restored"], [])
 
 
 class Integration(unittest.TestCase):
@@ -227,6 +292,94 @@ class Integration(unittest.TestCase):
         self.assertEqual(m.store.entries()[0][2].rooms, ["B-1"])
         self.assertEqual(m.job["normal"], 1)
         self.assertTrue(m.data["results"][entry_key(e)]["diagnosis"]["applied"])
+
+    def prepare_inventory(self, m, manual=False):
+        e = m.store.entries()[0][0]
+        rooms = [f"A-{i}" for i in range(1, 6)]
+        m.apply({"revision": m.store.entries()[1], "edits": [{"key": entry_key(e),
+            "rooms_only": True, "rooms": rooms, "room_authority": "manual" if manual else "auto"}]})
+        return m.store.entries()[0][0]
+
+    def test_inactive_inventory_roundtrip_cloud_and_restore(self):
+        from cloud.snapshot import pack, unpack
+        m = manager.Manager(self.folder)
+        e = self.prepare_inventory(m, manual=True)
+        before = m.store.db.read_bytes()
+        s = snapshot(*(card(f"A-{i}", str(i), ["예약마감"] if i == 1 else []) for i in range(1, 5)))
+        self.assertEqual(self.collect(m, e, s), 1)
+        current = m.store.entries()[0][0]
+        self.assertEqual(current.rooms, ["A-1", "A-2", "A-3", "A-4"])
+        self.assertTrue(m.manual_rooms(current))
+        self.assertEqual(current.price, e.price)
+        self.assertEqual(m.job["normal"], 1)
+        self.assertEqual(m.job["auto_changes"]["inactive"], 1)
+        r = m.data["results"][entry_key(e)]
+        self.assertEqual((r["reserved"], r["total"], r["missing"]), (1, 4, 0))
+        self.assertTrue(any(f.read_bytes() == before for f in m.store.home.glob("수정전_*/" + core.DB_FILENAME)))
+        with tempfile.TemporaryDirectory() as folder:
+            unpack(pack(m), folder)
+            reopened = manager.Manager(folder)
+            self.assertEqual(reopened.store.meta["auto_inactive_rooms"][entry_key(e)][0]["title"], "A-5")
+            s["roomCards"].append(card("A-5", "5", ["예약마감"]))
+            self.collect(reopened, reopened.store.entries()[0][0], s)
+            restored = reopened.store.entries()[0][0]
+            self.assertEqual(restored.rooms, e.rooms)
+            self.assertTrue(reopened.manual_rooms(restored))
+            self.assertEqual(reopened.job["normal"], 1)
+            self.assertEqual(reopened.job["auto_changes"]["restored"], 1)
+            self.assertEqual(reopened.store.meta["auto_inactive_rooms"][entry_key(e)], [])
+            self.assertEqual(len(reopened.store.history(entry_key(e))), 2)
+
+    def test_inventory_change_requires_both_complete_equal_reads(self):
+        for different in (False, True):
+            m = manager.Manager(self.folder)
+            e = self.prepare_inventory(m)
+            before = m.store.db.read_bytes()
+            first = snapshot(*(card(f"A-{i}", str(i)) for i in range(1, 5)), stable=different)
+            second = snapshot(*(card(f"A-{i}", str(i)) for i in range(1, 6 if different else 5)))
+            self.collect(m, e, first, second)
+            self.assertEqual(m.store.db.read_bytes(), before)
+            self.assertEqual(m.store.meta.get("auto_inactive_rooms", {}).get(entry_key(e), []), [])
+
+    def test_manual_facility_rename_requires_confirmation_and_keeps_user_title(self):
+        m = manager.Manager(self.folder)
+        e = m.store.entries()[0][2]
+        old = "개별샤워실 20사이트(8미터10미터)"
+        new = "공용샤워실 20사이트(8미터10미터)"
+        m.apply({"revision": m.store.entries()[1], "edits": [{"key": entry_key(e),
+            "rooms_only": True, "rooms": [old], "room_authority": "manual"}]})
+        e = m.store.entries()[0][2]
+        before = m.store.db.read_bytes()
+        self.assertEqual(self.collect(m, e, snapshot(card(new, "20"))), 1)
+        self.assertEqual(m.store.db.read_bytes(), before)
+        self.assertEqual(m.job["normal"], 1)
+        self.assertEqual(m.data["results"][entry_key(e)]["matched"], 1)
+
+    def test_user_new_room_list_cancels_automatic_restoration(self):
+        m = manager.Manager(self.folder)
+        e = self.prepare_inventory(m)
+        self.collect(m, e, snapshot(*(card(f"A-{i}", str(i)) for i in range(1, 5))))
+        current = m.store.entries()[0][0]
+        m.apply({"revision": m.store.entries()[1], "edits": [{"key": entry_key(e),
+            "rooms_only": True, "rooms": current.rooms, "room_authority": "manual"}]})
+        self.assertNotIn(entry_key(e), m.store.meta["auto_inactive_rooms"])
+
+    def test_failed_inventory_write_restores_db_and_archive_together(self):
+        import booking_store
+        m = manager.Manager(self.folder)
+        e = self.prepare_inventory(m)
+        before = m.store.db.read_bytes()
+        replace = booking_store.os.replace
+        def fail_db(source, destination):
+            if Path(destination) == m.store.db:
+                raise PermissionError("locked DB")
+            return replace(source, destination)
+        with patch.object(booking_store.os, "replace", side_effect=fail_db):
+            self.collect(m, e, snapshot(*(card(f"A-{i}", str(i)) for i in range(1, 5))))
+        self.assertEqual(m.store.db.read_bytes(), before)
+        self.assertEqual(m.store.meta.get("auto_inactive_rooms", {}).get(entry_key(e), []), [])
+        self.assertEqual(m.job["normal"], 0)
+        self.assertEqual(m.job["auto_changes"]["inactive"], 0)
 
 
 if __name__ == "__main__":

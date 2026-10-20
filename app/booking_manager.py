@@ -37,7 +37,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 
-VERSION = "2.6.3"
+VERSION = "2.7.0"
 
 
 class Manager:
@@ -166,7 +166,8 @@ class Manager:
                 if counts:
                     self.log(self.job["message"] + f" · 자동 DB 수정 {counts.get('entries', 0)}항목"
                              + f", 이름 추적 {counts.get('renamed', 0)}개, 신규 {counts.get('added', 0)}개"
-                             + f", 집계 대상 제외 {counts.get('excluded', 0)}개")
+                             + f", 집계 대상 제외 {counts.get('excluded', 0)}개"
+                             + f", 임시 보관 {counts.get('inactive', 0)}개, 자동 복원 {counts.get('restored', 0)}개")
         except Exception as exc:
             with self.lock:
                 self.job["state"] = "failed"
@@ -206,7 +207,12 @@ class Manager:
                  and entry_key(e) != key and entry_key(e) not in self.store.meta["archived"]]
 
         def inspect(current):
-            scoped = self.entry_snapshot(entry, current) if self.manual_rooms(entry) else current
+            scoped_rules = dict(rules)
+            if self.manual_rooms(entry):
+                # Keep explicit manual matches, but allow a renamed unseen product to be identified.
+                for identity, rule in self.entry_snapshot(entry, current)["roomRules"].items():
+                    if rule["mode"] == "include":
+                        scoped_rules[identity] = rule
             other_ids = set()
             for peer in peers:
                 old_rules = self.entry_snapshot(peer, previous)["roomRules"] if self.manual_rooms(peer) else rules
@@ -218,18 +224,21 @@ class Manager:
                     card, _ = core.choose_best_room_card(name, peer_cards, [], peer_keys, peer_aliases)
                     if card is not None:
                         other_ids.add(item_key(card))
-            return plan_changes(entry.rooms, scoped, scoped.get("roomRules", rules), bindings,
-                                manual=self.manual_rooms(entry), split=bool(peers), other_item_keys=other_ids)
+            return plan_changes(entry.rooms, current, scoped_rules, bindings,
+                                manual=self.manual_rooms(entry), split=bool(peers), other_item_keys=other_ids,
+                                automatic=kind == "collect",
+                                inactive=self.store.meta.get("auto_inactive_rooms", {}).get(key, []))
 
         plan = inspect(snapshot)
         verification = False
-        if kind == "collect" and (plan["changed"] or plan["missing"]) and entry.company_id not in confirmed:
+        if kind == "collect" and (plan["changed"] or plan["missing"] or plan["identity_changed"]) and entry.company_id not in confirmed:
             refresh = getattr(collector, "refresh_snapshot", None)
             if refresh and not self.stop.is_set():
                 self.log(f"{entry.sheet_title}: 변경 원인 재확인 중")
                 before = catalog_signature(snapshot)
+                first_stable = snapshot.get("listingStable") is True
                 _, snapshot = refresh(entry.company_id)
-                verification = (before == catalog_signature(snapshot)
+                verification = (first_stable and before == catalog_signature(snapshot)
                                 and snapshot.get("listingStable") is True)
                 confirmed[entry.company_id] = verification
                 plan = inspect(snapshot)
@@ -237,12 +246,18 @@ class Manager:
             verification = confirmed[entry.company_id]
         if self.stop.is_set():
             plan["changed"] = False
+            verification = False
         applied = False
         if kind == "collect" and plan["changed"] and verification:
             try:
+                inactive = [dict(record) for record in plan["inactive"]]
+                for record in inactive:
+                    record.setdefault("inactive_since", now())
+                    record.setdefault("checkin_date", self.job["date"])
                 self.store.apply({"revision": self.store.entries()[1],
-                    "edits": [{"key": key, "rooms_only": True, "rooms": plan["rooms"]}]},
-                    _collection_locked=True)
+                    "edits": [{"key": key, "rooms_only": True, "rooms": plan["rooms"],
+                               "room_authority": "manual" if self.manual_rooms(entry) else "auto"}]},
+                    _collection_locked=True, _inventory={key: inactive})
                 entry = next(e for e in self.store.entries()[0] if entry_key(e) == key)
                 self.data["room_bindings"][key] = plan["bindings"]
                 applied = True
@@ -251,11 +266,16 @@ class Manager:
                 plan["summary"] += " / 자동 변경 보류: " + str(exc)
         elif plan["changed"]:
             plan["summary"] += " / 변경 후보 재확인 필요 · DB 유지"
+        if verification and plan["identity_changed"] and not plan["changed"]:
+            self.data["room_bindings"][key] = plan["bindings"]
         plan["applied"] = applied
         counts = self.job.setdefault("auto_changes", {"entries": 0, "renamed": 0, "added": 0, "excluded": 0})
         counts["entries"] += int(applied)
-        counts["renamed"] += len(plan["renamed"])
+        if applied or (not plan["changed"] and (verification or not plan["identity_changed"])):
+            counts["renamed"] += len(plan["renamed"])
         counts["added"] += len(plan["added"]) if applied else 0
+        counts["inactive"] = counts.get("inactive", 0) + (len(plan["inactive_new"]) if applied else 0)
+        counts["restored"] = counts.get("restored", 0) + (len(plan["restored"]) if applied else 0)
         return entry, snapshot, plan
 
     def _proposal(self, entry, snapshot, revision):

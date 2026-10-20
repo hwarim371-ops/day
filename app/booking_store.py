@@ -178,7 +178,7 @@ class Store:
                 continue
         return latest
 
-    def apply(self, payload, *, room_rules=None, archive_keys=(), _collection_locked=False):
+    def apply(self, payload, *, room_rules=None, archive_keys=(), _collection_locked=False, _inventory=None):
         with nullcontext() if _collection_locked else core.collection_run_lock(self.folder):
             entries, rev = self.entries()
             edits = payload.get("edits", [])
@@ -257,6 +257,9 @@ class Store:
                         manual = self.meta.setdefault("manual_rooms", {}).pop(key, None)
                         if manual:
                             self.meta["manual_rooms"][new_key] = manual
+                        inactive = self.meta.setdefault("auto_inactive_rooms", {}).pop(key, None)
+                        if inactive:
+                            self.meta["auto_inactive_rooms"][new_key] = inactive
                 for edit, key in zip(edits, touched):
                     if "region" in edit and not edit.get("rooms_only"):
                         self.meta["regions"][key] = str(edit["region"])[:150]
@@ -266,6 +269,13 @@ class Store:
                         self.meta.setdefault("manual_rooms", {})[key] = {"rooms": entry.rooms, "saved_at": now()}
                     elif authority == "auto":
                         self.meta.setdefault("manual_rooms", {}).pop(key, None)
+                    if _inventory is None and edit.get("key") in by_key:
+                        before = by_key[edit["key"]]
+                        after = next(e for e in final if entry_key(e) == key)
+                        if before.rooms != after.rooms or authority == "manual":
+                            self.meta.setdefault("auto_inactive_rooms", {}).pop(key, None)
+                if _inventory is not None:
+                    self.meta.setdefault("auto_inactive_rooms", {}).update(_inventory)
                 self.meta["changed"] = sorted(set(self.meta["changed"] + touched))
                 if room_rules is not None:
                     self.meta.setdefault("room_rules", {}).update(room_rules)
