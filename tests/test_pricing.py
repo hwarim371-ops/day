@@ -20,6 +20,18 @@ def card(title, price, detail="최소 1박", **extra):
 
 
 class PriceParsing(unittest.TestCase):
+    def test_undated_price_cache_never_replaces_dated_booking_snapshot(self):
+        collector = core.BrowserCollector(core.parse_date("2026-11-15"), [], False, 25, lambda _: None)
+        bookings, prices = {"source": "bookings"}, {"source": "prices"}
+        with patch.object(collector, "_read_snapshot", side_effect=[bookings, prices]) as read:
+            dated_url, current = collector.get_snapshot("123456789")
+            price_url, listed = collector.get_price_snapshot("123456789")
+            self.assertIn("checkin=20261115", dated_url)
+            self.assertNotIn("checkin=", price_url)
+            self.assertIs(collector.get_snapshot("123456789")[1], current)
+            self.assertIs(collector.get_price_snapshot("123456789")[1], listed)
+            self.assertEqual(read.call_count, 2)
+
     def test_range_and_single(self):
         for text, expected in [("70,000 ~ 80,000원", 80000), ("70,000원~80,000원", 80000),
                                ("80000원", 80000), ("70,000～80,000원 Npay+", 80000),
