@@ -601,7 +601,7 @@ class Manager:
                 unchanged = bool(old and fingerprint(old) == fingerprint(new)
                     and before_policy[old_key] == (self.manual_rooms(new), self.rules_revision(new.company_id)))
                 previous = self.data["results"].get(old_key)
-                price_only = bool(old and only_price_changed(old, new)
+                price_only = bool(old and old.price != new.price and only_price_changed(old, new)
                     and before_policy[old_key] == (self.manual_rooms(new), self.rules_revision(new.company_id)))
                 if not price_only:
                     self.data["proposals"].pop(edit.get("key"), None)

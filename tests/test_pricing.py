@@ -97,6 +97,14 @@ class PricingIntegration(unittest.TestCase):
         self.save(price="80000", rooms=["A-1"])
         self.assertTrue(self.m.state()["entries"][0]["changed"])
 
+    def test_identical_manual_confirmation_still_clears_old_proposal(self):
+        self.save(room_authority="manual")
+        self.collect()
+        key = self.m.state()["entries"][0]["key"]
+        self.m.data["proposals"][key] = {"error": "old review"}
+        self.save()
+        self.assertIsNone(self.m.state()["entries"][0]["proposal"])
+
     def test_manual_price_survives_rename_and_clear_releases(self):
         self.save(price="80000")
         old = self.m.state()["entries"][0]["key"]
