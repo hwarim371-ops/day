@@ -183,7 +183,7 @@ function state_(knownManifest, knownJobs) {
   state.job.remote_log = !!state.job.id;
   state.busy = !!job && !TERMINAL.includes(job.state);
   state.cloud = true;
-  state.version = '2.9.0';
+  state.version = '2.9.1';
   state.folder = 'Google Drive';
   state.today = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd');
   state.drive_url = 'https://drive.google.com/drive/folders/' + setting_('ROOT_FOLDER_ID');

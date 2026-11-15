@@ -27,30 +27,62 @@ def history(start=date(2026, 10, 19), count=28, weekday=8, weekend=4):
 
 
 class PolicyTests(unittest.TestCase):
-    def test_sunday_through_thursday_are_weekdays_even_full(self):
+    def test_sunday_through_thursday_require_a_sustained_pattern(self):
         for offset in range(7):
             day = date(2026, 11, 15) + timedelta(days=offset)
-            a = assess([], {"date": day.isoformat(), "reserved": 10, "total": 10, "revenue": 90000})
+            rows = history(start=day-timedelta(days=27), weekday=10)
+            a = assess(rows, {"date": day.isoformat(), "reserved": 10, "total": 10, "revenue": 90000})
             self.assertEqual(a["assumed_closed"], offset < 5)
             self.assertEqual(a["revenue"], 0 if offset < 5 else 90000)
             self.assertEqual(a["rate"], None if offset < 5 else 1)
             self.assertEqual(a["total"], 0 if offset < 5 else 10)
 
-    def test_full_weekday_is_assumption_without_history(self):
+    def test_full_weekday_alone_keeps_unknown_revenue(self):
         a = assess([], {"date": "2026-11-15", "reserved": 1, "total": 1, "revenue": None})
-        self.assertEqual(a["reason"], "weekday_full")
+        self.assertEqual(a["reason"], "insufficient")
         self.assertFalse(a["sufficient"])
-        self.assertEqual(a["revenue"], 0)
+        self.assertFalse(a["assumed_closed"])
+        self.assertIsNone(a["revenue"])
 
-    def test_average_reversal(self):
+    def test_average_reversal_below_full_keeps_original(self):
         rows = history()
         before = copy.deepcopy(rows)
         a = assess(rows, rows[-1])
         self.assertEqual((a["weekday_days"], a["weekend_days"]), (20, 8))
         self.assertEqual((a["weekday_rate"], a["weekend_rate"]), (.8, .4))
-        self.assertEqual(a["reason"], "weekday_above_weekend")
-        self.assertEqual(a["revenue"], 0)
+        self.assertEqual(a["reason"], "unchanged")
+        self.assertEqual(a["revenue"], 80000)
         self.assertEqual(rows, before)
+
+    def test_only_full_weekday_average_and_nonfull_weekends_are_closed(self):
+        for weekday, weekend, expected in [(10,8,True),(10,0,True),(10,10,False),(9,8,False),(8,4,False)]:
+            rows = history(weekday=weekday, weekend=weekend)
+            a = assess(rows, rows[-1])
+            self.assertEqual(a["assumed_closed"], expected)
+            self.assertEqual(a["revenue"], 0 if expected else rows[-1]["revenue"])
+
+    def test_one_full_day_does_not_override_the_average(self):
+        rows = history(weekday=8, weekend=6)
+        current = {**rows[-1], "reserved":10, "revenue":100000}
+        a = assess(rows,current)
+        self.assertFalse(a["assumed_closed"])
+        self.assertEqual(a["revenue"],100000)
+        self.assertLess(a["weekday_rate"],1)
+
+    def test_rounded_100_percent_is_not_exactly_full(self):
+        rows = history(weekday=10)
+        for row in rows:
+            row.update(total=10000, reserved=10000 if date.fromisoformat(row["date"]).weekday() not in (4,5) else 8000)
+        rows[0]["reserved"] -= 1
+        a = assess(rows,rows[-1])
+        self.assertEqual(round(a["weekday_rate"]*100,1),100)
+        self.assertFalse(a["assumed_closed"])
+
+    def test_missing_weekends_never_imply_zero_percent(self):
+        rows = [r for r in history(weekday=10) if date.fromisoformat(r["date"]).weekday() not in (4,5)]
+        a = assess(rows,rows[-1])
+        self.assertIsNone(a["weekend_rate"])
+        self.assertFalse(a["assumed_closed"])
 
     def test_equal_or_lower_is_not_closed(self):
         for weekday in (4, 2):
@@ -96,19 +128,19 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(assess([], {**history()[-1], **change}))
 
     def test_historical_assessments_do_not_use_future_data(self):
-        rows = history()
+        rows = history(weekday=10)
         points = annotate_history(rows)
         self.assertEqual(points[0]["business_adjustment"]["reason"], "insufficient")
-        self.assertEqual(points[-1]["business_adjustment"]["reason"], "weekday_above_weekend")
-        self.assertEqual(points[0]["reserved"], 8)
-        self.assertEqual(points[-1]["revenue"], 80000)
+        self.assertEqual(points[-1]["business_adjustment"]["reason"], "weekday_average_full")
+        self.assertEqual(points[0]["reserved"], 10)
+        self.assertEqual(points[-1]["revenue"], 100000)
 
     def test_average_is_room_day_weighted(self):
         rows = history(weekday=4, weekend=4)
         rows[0].update(total=100, reserved=90)
         a = assess(rows, rows[-1])
         self.assertAlmostEqual(a["weekday_rate"], (90+19*4)/(100+19*10))
-        self.assertTrue(a["assumed_closed"])
+        self.assertFalse(a["assumed_closed"])
 
 
 class ExportTests(unittest.TestCase):
@@ -170,12 +202,34 @@ class ExportTests(unittest.TestCase):
         self.manager.data["results"][key] = {"status":"정상", "date":"2026-11-15", "reserved":2,
             "total":2, "fingerprint":fingerprint(entry), "parser_version":PARSER_VERSION,
             "rules_revision":self.manager.rules_revision(entry.company_id)}
-        self.assertTrue(self.manager.state()["entries"][0]["business_adjustment"]["assumed_closed"])
-        self.manager.data["results"][key]["status"] = "확인 필요"
-        self.assertIsNone(self.manager.state()["entries"][0]["business_adjustment"])
-        self.manager.data["results"][key]["status"] = "정상"
-        self.manager.data["results"][key]["superseded"] = True
-        self.assertIsNone(self.manager.state()["entries"][0]["business_adjustment"])
+        with patch.object(self.manager.store, "histories", return_value={key:history(weekday=10)}):
+            self.assertTrue(self.manager.state()["entries"][0]["business_adjustment"]["assumed_closed"])
+            self.manager.data["results"][key]["status"] = "확인 필요"
+            self.assertIsNone(self.manager.state()["entries"][0]["business_adjustment"])
+            self.manager.data["results"][key]["status"] = "정상"
+            self.manager.data["results"][key]["superseded"] = True
+            self.assertIsNone(self.manager.state()["entries"][0]["business_adjustment"])
+
+    def test_export_recalculates_legacy_adjustments_from_raw_records(self):
+        entry = self.manager.store.entries()[0][0]
+        wb = load_workbook(self.manager.store.result)
+        ws = wb[entry.sheet_title]
+        ws.delete_rows(1,ws.max_row)
+        ws.append(['일자','예약','전체','비율','금액','추정매출','보정가동률','보정매출','사유'])
+        for row in history():
+            ws.append([date.fromisoformat(row['date']),row['reserved'],row['total'],row['reserved']/row['total'],
+                       10000,row['revenue'],None,0,'평균 역전'])
+        wb.save(self.manager.store.result)
+        wb.close()
+        state = self.manager.state()
+        exported = load_workbook(io.BytesIO(workbook_bytes(self.manager.store.result,state,self.manager.store.histories())))
+        try:
+            last = exported[entry.sheet_title].max_row
+            self.assertEqual(exported[entry.sheet_title].cell(last,6).value,80000)
+            self.assertEqual(exported[entry.sheet_title].cell(last,8).value,80000)
+            self.assertEqual(exported[entry.sheet_title].cell(last,9).value,'보정 없음')
+        finally:
+            exported.close()
 
 
 if __name__ == "__main__":

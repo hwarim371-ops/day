@@ -6,8 +6,8 @@ import math
 from datetime import date, timedelta
 
 
-POLICY = {"version": "weekday-off-v1", "window_days": 28, "min_weekdays": 10,
-          "min_weekends": 4, "weekday_full_closed": True,
+POLICY = {"version": "weekday-off-v2", "window_days": 28, "min_weekdays": 10,
+          "min_weekends": 4, "weekday_average_full_only": True,
           "weekend_days": ["Friday", "Saturday"]}
 
 
@@ -54,12 +54,14 @@ def assess(history, current):
     weekend_reserved = sum(h["reserved"] for h in weekends)
     sufficient = (len(weekdays) >= POLICY["min_weekdays"]
                   and len(weekends) >= POLICY["min_weekends"])
-    above = sufficient and weekday_reserved * weekend_total > weekend_reserved * weekday_total
+    # Compare integer room-day totals, not rounded display percentages. A single
+    # full weekday or an average merely higher than weekends is not enough.
+    pattern = (sufficient and weekday_reserved == weekday_total
+               and weekend_reserved < weekend_total)
     weekend = is_weekend(day)
-    full = current["reserved"] == current["total"]
-    reason = ("weekend" if weekend else "weekday_full" if full else
-              "weekday_above_weekend" if above else "insufficient" if not sufficient else "unchanged")
-    closed = reason in {"weekday_full", "weekday_above_weekend"}
+    reason = ("weekend" if weekend else "insufficient" if not sufficient else
+              "weekday_average_full" if pattern else "unchanged")
+    closed = reason == "weekday_average_full"
     revenue = current.get("revenue")
     if isinstance(revenue, bool) or not isinstance(revenue, (int, float)) or not math.isfinite(revenue) or revenue < 0:
         revenue = None
@@ -83,8 +85,7 @@ def annotate_history(rows):
 def reason_label(adjustment):
     if not adjustment:
         return "집계 제외"
-    return {"weekend": "주말 · 원본 유지", "weekday_full": "평일 미영업 추정 · 100% 마감",
-            "weekday_above_weekend": "평일 미영업 추정 · 평균 역전",
+    return {"weekend": "주말 · 원본 유지", "weekday_average_full": "평일 미영업 추정 · 평일 평균 100%",
             "insufficient": "비교 자료 부족 · 원본 유지", "unchanged": "보정 없음"}[adjustment["reason"]]
 
 
