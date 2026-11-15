@@ -36,8 +36,9 @@ from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
+from booking_pricing import nightly_max, only_price_changed
 
-VERSION = "2.7.0"
+VERSION = "2.8.0"
 
 
 class Manager:
@@ -107,6 +108,7 @@ class Manager:
                     "item_groups": groups, "rules_revision": self.rules_revision(e.company_id),
                     "items_checked_at": catalog.get("checked_at") if catalog else None})
                 rows[-1]["room_authority"] = "manual" if self.manual_rooms(e) else "auto"
+                rows[-1]["price_policy"] = self.store.meta.get("price_policy", {}).get(key, {})
             order = read_json(self.order_path, {"keys": [], "revision": ""})
             return copy.deepcopy({"version": VERSION, "parser_version": PARSER_VERSION, "folder": str(self.store.folder), "today": date.today().isoformat(),
                 "display_order": order["keys"], "order_revision": order["revision"],
@@ -367,6 +369,10 @@ class Manager:
                                 other_keys, other_snapshot.get("roomAliases"))[0] for k in other_keys]
                             if set(matched_ids) & {item_key(c) for c in other_cards if c is not None}:
                                 result.status = "분류 간 동일 상품 중복: 객실 배정 확인 필요"
+                        if kind == "collect" and result.status == "정상":
+                            e = self._refresh_price(e, collector)
+                            result.entry = e
+                            proposal["revision"] = rev = self.store.entries()[1]
                         with self.lock:
                             self.data["proposals"][key] = proposal
                             if kind == "collect":
@@ -430,6 +436,50 @@ class Manager:
             finally:
                 if wb:
                     wb.close()
+
+    def _refresh_price(self, entry, collector):
+        key = entry_key(entry)
+        if self.store.meta.get("price_policy", {}).get(key, {}).get("mode") == "manual":
+            return entry
+        reader = getattr(collector, "get_price_snapshot", None)
+        if reader is None:
+            return entry
+        try:
+            url, snapshot = reader(entry.company_id)
+            if snapshot.get("listingStable") is not True:
+                self.log(f"{entry.sheet_title}: 가격 목록 미확인 · 기존 금액 유지")
+                return entry
+            scoped = self.entry_snapshot(entry, snapshot)
+            filtered, _ = filtered_snapshot(scoped, scoped["roomRules"])
+            keys = core.normalized_room_list(entry.rooms)
+            cards = [core.choose_best_room_card(k, filtered["roomCards"], [], keys,
+                     scoped.get("roomAliases"))[0] for k in keys]
+            ids = [item_key(c) for c in cards if c is not None]
+            if len(ids) != len(set(ids)):
+                return entry
+            priced = [(nightly_max(c), c) for c in cards if c is not None]
+            priced = [(amount, c) for amount, c in priced if amount is not None]
+            if not priced:
+                self.log(f"{entry.sheet_title}: 표시 가격 없음 · 기존 금액 유지")
+                return entry
+            amount, source = max(priced, key=lambda pair: pair[0])
+            policy = {"mode": "auto_max", "amount": amount, "checked_at": now(),
+                      "source_url": url, "itemKey": item_key(source), "title": source["title"],
+                      "priced_rooms": len(priced), "total_rooms": len(entry.rooms)}
+            if exact_price(entry.price) != amount:
+                self.store.apply({"revision": self.store.entries()[1], "edits": [
+                    {**asdict(entry), "key": key, "price": str(amount)}]},
+                    _collection_locked=True, _price_policy={key: policy})
+                entry = next(e for e in self.store.entries()[0] if entry_key(e) == key)
+                self.job.setdefault("price_updates", []).append({"key": key, "name": entry.sheet_title, "amount": amount})
+            else:
+                self.store.meta.setdefault("price_policy", {})[key] = policy
+            self.log(f"{entry.sheet_title}: 숙박 표시 최고가 {amount:,}원 · 가격 확인 {len(priced)}/{len(entry.rooms)}개")
+        except Exception as exc:
+            if "접근 제한" in str(exc) or "접근을 제한" in str(exc):
+                raise
+            self.log(f"{entry.sheet_title}: 가격 확인/저장 보류 · 기존 금액 유지 ({exc})")
+        return entry
 
     def _overview(self, wb, checkin):
         title = core.STATUS_SHEET_NAME
@@ -515,7 +565,34 @@ class Manager:
             before_entries = {entry_key(e): e for e in self.store.entries()[0]}
             before_changed = set(self.store.meta["changed"])
             before_policy = {key: (self.manual_rooms(e), self.rules_revision(e.company_id)) for key, e in before_entries.items()}
-            result = self.store.apply(payload, room_rules=room_rules, archive_keys=archive_keys)
+            price_policy, price_rows = {}, {}
+            for edit in payload.get("edits", []):
+                old = before_entries.get(edit.get("key"))
+                if edit.get("rooms_only"):
+                    continue
+                key = edit.get("key")
+                next_key = entry_key(core.DbEntry(0, str(edit.get("company_id", "")).strip(), "", str(edit.get("sheet_title", "")).strip(), "", []))
+                policy = self.store.meta.get("price_policy", {}).get(key, {})
+                value = str(edit.get("price", "")).strip()
+                if (not old or value != old.price or not policy) and value:
+                    price_policy[next_key] = {"mode": "manual", "saved_at": now()}
+                elif old and value != old.price and not value:
+                    price_policy[next_key] = {"mode": "auto_max", "saved_at": now()}
+                previous = self.data["results"].get(key)
+                if old and previous and not room_rules:
+                    new = core.DbEntry(old.excel_row, str(edit.get("company_id", "")), str(edit.get("major", "")).strip(),
+                                      str(edit.get("sheet_title", "")).strip(), value, edit.get("rooms", []))
+                    if isinstance(new.rooms, str):
+                        new.rooms = [v.strip() for v in new.rooms.splitlines() if v.strip()]
+                    same_policy = edit.get("room_authority", "manual" if before_policy[key][0] else "auto") == ("manual" if before_policy[key][0] else "auto")
+                    if (only_price_changed(old, new) and same_policy and value != old.price
+                            and previous.get("status") == "정상" and not previous.get("superseded")
+                            and previous.get("fingerprint") == fingerprint(old)
+                            and previous.get("parser_version") == PARSER_VERSION
+                            and previous.get("rules_revision") == self.rules_revision(old.company_id)):
+                        price_rows[key] = previous
+            result = self.store.apply(payload, room_rules=room_rules, archive_keys=archive_keys,
+                                      _price_policy=price_policy, _price_rows=price_rows)
             after_entries = {entry_key(e): e for e in self.store.entries()[0]}
             for edit, new_key in zip(payload["edits"], result["keys"]):
                 old_key = edit.get("key")
@@ -523,9 +600,14 @@ class Manager:
                 new = after_entries[new_key]
                 unchanged = bool(old and fingerprint(old) == fingerprint(new)
                     and before_policy[old_key] == (self.manual_rooms(new), self.rules_revision(new.company_id)))
-                self.data["proposals"].pop(edit.get("key"), None)
                 previous = self.data["results"].get(old_key)
-                if unchanged:
+                price_only = bool(old and only_price_changed(old, new)
+                    and before_policy[old_key] == (self.manual_rooms(new), self.rules_revision(new.company_id)))
+                if not price_only:
+                    self.data["proposals"].pop(edit.get("key"), None)
+                if price_only and previous and previous.get("fingerprint") == fingerprint(old) and not previous.get("superseded"):
+                    previous["fingerprint"] = fingerprint(new)
+                if unchanged or price_only:
                     if old_key not in before_changed:
                         self.store.meta["changed"] = [k for k in self.store.meta["changed"] if k != new_key]
                 elif previous:

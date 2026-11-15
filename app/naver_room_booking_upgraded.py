@@ -1034,6 +1034,7 @@ class BrowserCollector:
         self._page = None
         self._timeout_error = None
         self._snapshots: dict[str, dict] = {}
+        self._price_snapshots: dict[str, dict] = {}
 
     def __enter__(self) -> "BrowserCollector":
         sync_playwright, timeout_error = import_playwright()
@@ -1076,11 +1077,23 @@ class BrowserCollector:
         if company_id in self._snapshots:
             return build_naver_room_url(company_id, self.checkin), self._snapshots[company_id]
 
+        url = build_naver_room_url(company_id, self.checkin)
+        self.progress(f"[{log_time()}] 접속: {company_id}")
+        snapshot = self._read_snapshot(url)
+        self._snapshots[company_id] = snapshot
+        return url, snapshot
+
+    def get_price_snapshot(self, company_id: str) -> tuple[str, dict]:
+        url = f"https://m.place.naver.com/accommodation/{company_id}/room?entry=pll&businessCategory=camping"
+        if company_id not in self._price_snapshots:
+            self._price_snapshots[company_id] = self._read_snapshot(url)
+        return url, self._price_snapshots[company_id]
+
+    def _read_snapshot(self, url: str) -> dict:
+
         if not self._page:
             raise RuntimeError("브라우저가 준비되지 않았습니다.")
 
-        url = build_naver_room_url(company_id, self.checkin)
-        self.progress(f"[{log_time()}] 접속: {company_id}")
         timeout_ms = max(self.wait_seconds, 5) * 1000
         self._page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         response_text = self._page.inner_text("body")
@@ -1094,8 +1107,7 @@ class BrowserCollector:
         listing_stable = self._scroll_to_bottom()
         snapshot = self._page.evaluate(EXTRACT_SCRIPT, {"statusKeys": self.status_words})
         snapshot["listingStable"] = bool(listing_stable and not snapshot.get("pendingListing"))
-        self._snapshots[company_id] = snapshot
-        return url, snapshot
+        return snapshot
 
     def refresh_snapshot(self, company_id: str) -> tuple[str, dict]:
         self._snapshots.pop(company_id, None)

@@ -178,7 +178,8 @@ class Store:
                 continue
         return latest
 
-    def apply(self, payload, *, room_rules=None, archive_keys=(), _collection_locked=False, _inventory=None):
+    def apply(self, payload, *, room_rules=None, archive_keys=(), _collection_locked=False, _inventory=None,
+              _price_policy=None, _price_rows=None):
         with nullcontext() if _collection_locked else core.collection_run_lock(self.folder):
             entries, rev = self.entries()
             edits = payload.get("edits", [])
@@ -260,6 +261,9 @@ class Store:
                         inactive = self.meta.setdefault("auto_inactive_rooms", {}).pop(key, None)
                         if inactive:
                             self.meta["auto_inactive_rooms"][new_key] = inactive
+                        pricing = self.meta.setdefault("price_policy", {}).pop(key, None)
+                        if pricing:
+                            self.meta["price_policy"][new_key] = pricing
                 for edit, key in zip(edits, touched):
                     if "region" in edit and not edit.get("rooms_only"):
                         self.meta["regions"][key] = str(edit["region"])[:150]
@@ -272,10 +276,38 @@ class Store:
                     if _inventory is None and edit.get("key") in by_key:
                         before = by_key[edit["key"]]
                         after = next(e for e in final if entry_key(e) == key)
-                        if before.rooms != after.rooms or authority == "manual":
+                        if before.rooms != after.rooms or (authority == "manual" and before.price == after.price):
                             self.meta.setdefault("auto_inactive_rooms", {}).pop(key, None)
                 if _inventory is not None:
                     self.meta.setdefault("auto_inactive_rooms", {}).update(_inventory)
+                if _price_policy is not None:
+                    self.meta.setdefault("price_policy", {}).update(_price_policy)
+                if result_wb and _price_rows:
+                    for key, record in _price_rows.items():
+                        entry = replacement[key]
+                        amount = exact_price(entry.price)
+                        revenue = record["reserved"] * amount if amount is not None else None
+                        if entry.sheet_title in result_wb.sheetnames:
+                            history = result_wb[entry.sheet_title]
+                            for row in range(2, history.max_row + 1):
+                                if (core.same_day(history.cell(row, 1).value, core.parse_date(record["date"]))
+                                        and history.cell(row, 2).value == record["reserved"]
+                                        and history.cell(row, 3).value == record["total"]):
+                                    history.cell(row, 5).value = amount if amount is not None else entry.price
+                                    if amount is None:
+                                        history.cell(row, 5).data_type = "s"
+                                    history.cell(row, 6).value = revenue
+                        if core.STATUS_SHEET_NAME in result_wb.sheetnames:
+                            overview = result_wb[core.STATUS_SHEET_NAME]
+                            for row in range(2, overview.max_row + 1):
+                                if (str(overview.cell(row, 1).value) == entry.company_id
+                                        and overview.cell(row, 3).value == entry.sheet_title
+                                        and core.same_day(overview.cell(row, 4).value, core.parse_date(record["date"]))
+                                        and overview.cell(row, 11).value == "정상"):
+                                    overview.cell(row, 9).value = amount if amount is not None else entry.price
+                                    if amount is None:
+                                        overview.cell(row, 9).data_type = "s"
+                                    overview.cell(row, 10).value = revenue
                 self.meta["changed"] = sorted(set(self.meta["changed"] + touched))
                 if room_rules is not None:
                     self.meta.setdefault("room_rules", {}).update(room_rules)

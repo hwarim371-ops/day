@@ -143,8 +143,11 @@ class ManualPriorityTests(unittest.TestCase):
         self.assertFalse(row['result']['stale'])
         self.save(price='70000')
         row = self.manager.state()['entries'][0]
-        self.assertTrue(row['pending_collection'])
-        self.assertTrue(row['result']['superseded'])
+        self.assertFalse(row['pending_collection'])
+        self.assertFalse(row['result'].get('superseded'))
+        self.assertFalse(row['result']['stale'])
+        self.assertEqual(row['result']['checked_at'], before['checked_at'])
+        self.assertEqual(self.manager.store.history(key)[-1]['revenue'], 70000)
 
     def test_old_changed_flag_with_completed_attempt_is_not_unsaved(self):
         self.test_missing_manual_room_is_unknown_not_zero_booking_success()
