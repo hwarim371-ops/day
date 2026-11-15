@@ -57,6 +57,14 @@ class PriceParsing(unittest.TestCase):
         self.assertIsNone(nightly_max({**known, "title": "캠크닉"}, confirmed_room=True))
         self.assertIsNone(nightly_max({**known, "title": "쿠폰"}, confirmed_room=True))
 
+    def test_floorplan_note_on_confirmed_room_is_not_a_notice_product(self):
+        known = card("T5 글램핑 (더블,트윈베드/배치도 확인)", "199,000 ~\n부터\n289,000원",
+                     schemaVersion=3, unitEvidence=True, overnightEvidence=True)
+        self.assertIsNone(nightly_max(known))
+        self.assertEqual(nightly_max(known, confirmed_room=True), 289000)
+        for title in ["배치도 확인", "(배치도 확인)", "공지사항 (배치도 확인)"]:
+            self.assertIsNone(nightly_max({**known, "title": title}, confirmed_room=True))
+
 
 class PricingIntegration(unittest.TestCase):
     def setUp(self):

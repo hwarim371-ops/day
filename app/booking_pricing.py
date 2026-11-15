@@ -10,13 +10,17 @@ PRICE_LINE = re.compile(
 
 
 def nightly_max(card, *, confirmed_room=False):
-    decision, reason = classify(card)
+    title = str(card.get("title", ""))
+    pricing_card = card
+    if confirmed_room and card.get("unitEvidence") and card.get("overnightEvidence"):
+        clean_title = re.sub(r"\([^()]*배치도\s*확인[^()]*\)", "", title).strip()
+        pricing_card = {**card, "title": clean_title}
+    decision, reason = classify(pricing_card)
     missing_type = (confirmed_room and card.get("unitEvidence")
                     and reason == "숙박·캠핑사이트 근거 부족")
     if decision != "room" and not missing_type:
         return None
     text = str(card.get("text", ""))
-    title = str(card.get("title", ""))
     # A two-night package is not a nightly tariff.
     nights = re.findall(r"최소\s*(\d+)\s*박|\((\d+)박\)", text + "\n" + title)
     if any(int(a or b) > 1 for a, b in nights):
