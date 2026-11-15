@@ -44,6 +44,7 @@ def unpack(data, folder, expected_hash=None):
 
 
 def pack(manager):
+    from booking_business import workbook_bytes
     manager.persist()
     manager.store.save_meta()
     state = manager.state()
@@ -52,10 +53,10 @@ def pack(manager):
     state.pop("downloads", None)
     state["job"] = dict(state["job"])
     state["job"].pop("csv", None)
-    history = {entry["key"]: manager.store.history(entry["key"]) for entry in state["entries"]}
+    history = manager.store.histories()
     values = {
         "db.xlsx": manager.store.db.read_bytes(),
-        "result.xlsx": manager.store.result.read_bytes(),
+        "result.xlsx": workbook_bytes(manager.store.result, state, history),
         "catalog.json": manager.store.meta_path.read_bytes(),
         "workspace.json": manager.state_path.read_bytes(),
         "state.json": json.dumps(state, ensure_ascii=False).encode("utf-8"),

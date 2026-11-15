@@ -5,6 +5,7 @@ import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_FILES = ['booking_manager.py', 'booking_store.py', 'booking_discovery.py',
+             'booking_pricing.py', 'booking_business.py',
              'naver_room_booking_upgraded.py', 'room_classifier.py', 'room_reconcile.py', 'booking_file_lock.py']
 WEB_FILES = ['index.html', 'app.js', 'style.css', 'lucide.min.js', 'LUCIDE_LICENSE']
 

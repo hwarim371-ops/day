@@ -183,7 +183,7 @@ function state_(knownManifest, knownJobs) {
   state.job.remote_log = !!state.job.id;
   state.busy = !!job && !TERMINAL.includes(job.state);
   state.cloud = true;
-  state.version = '2.5.2';
+  state.version = '2.9.0';
   state.folder = 'Google Drive';
   state.today = Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM-dd');
   state.drive_url = 'https://drive.google.com/drive/folders/' + setting_('ROOT_FOLDER_ID');
@@ -224,9 +224,9 @@ function uiRequest(path, payload, requestId) {
         saveJob_(job);
         return {message: job.message};
       }
-      const routes = {'/api/start': payload && payload.kind, '/api/apply': 'apply', '/api/archive': 'archive', '/api/room-rules': 'room-rules', '/api/approve-review': 'approve-review'};
+      const routes = {'/api/start': payload && payload.kind, '/api/apply': 'apply', '/api/archive': 'archive', '/api/room-rules': 'room-rules', '/api/approve-review': 'approve-review', '/api/business-refresh': 'business-refresh'};
       const kind = routes[path];
-      if (!['collect', 'scan', 'discover', 'verify', 'apply', 'archive', 'room-rules', 'approve-review'].includes(kind)) throw new Error('알 수 없는 요청');
+      if (!['collect', 'scan', 'discover', 'verify', 'apply', 'archive', 'room-rules', 'approve-review', 'business-refresh'].includes(kind)) throw new Error('알 수 없는 요청');
       return dispatch_(kind, payload, requestId);
     });
     return {ok: true, value: value};
@@ -270,7 +270,7 @@ function dispatch_(kind, payload, requestId) {
       method: 'post', contentType: 'application/json', muteHttpExceptions: true,
       headers: {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'},
       payload: JSON.stringify({ref: branch, inputs: {job_id: job.id,
-        needs_browser: String(!['apply', 'archive', 'room-rules', 'approve-review'].includes(kind) || (['apply', 'approve-review'].includes(kind) && payload.collect_after === true))}})
+        needs_browser: String(!['apply', 'archive', 'room-rules', 'approve-review', 'business-refresh'].includes(kind) || (['apply', 'approve-review'].includes(kind) && payload.collect_after === true))}})
     });
     if (![200, 204].includes(response.getResponseCode())) {
       Object.assign(job, {state: 'failed', message: 'GitHub 실행 요청 실패 (' + response.getResponseCode() + '). 저장소와 Actions 권한을 확인해 주세요.', finished_at: iso_()});

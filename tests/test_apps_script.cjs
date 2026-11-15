@@ -250,6 +250,18 @@ test('confirmed review dispatches one authenticated combined job', () => {
   assert.equal(claim.value.job.payload.collect_after, true);
   assert.equal(h.dispatchCount(), 1);
 });
+test('business refresh is owner and revision protected, with one authenticated job', () => {
+  const h = harness(), revision = h.context.uiRequest('/api/state').value.revision;
+  h.setEmail('not-owner@example.com');
+  assert.equal(h.context.uiRequest('/api/business-refresh',{revision},requestId()).ok,false);
+  h.setEmail('owner@example.com');
+  assert.equal(h.context.uiRequest('/api/business-refresh',{revision:'old'},requestId()).ok,false);
+  const id = requestId(), payload = {revision,date:'2026-11-15'};
+  assert.equal(h.context.uiRequest('/api/business-refresh',payload,id).ok,true);
+  assert.equal(h.context.uiRequest('/api/business-refresh',payload,id).ok,true);
+  assert.equal(h.dispatchCount(),1);
+  assert.equal(h.claim(id).value.job.kind,'business-refresh');
+});
 test('review approval never uses the manual revision bypass', () => {
   const h = harness();
   const response = h.context.uiRequest('/api/approve-review', {revision: 'old', force_manual: true,

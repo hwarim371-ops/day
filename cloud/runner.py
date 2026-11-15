@@ -121,6 +121,21 @@ class Bridge:
 def execute(bridge, manager, job):
     kind, payload = job["kind"], job["payload"]
     response = {}
+    if kind == "business-refresh":
+        from naver_room_booking_upgraded import parse_date
+        day = parse_date(payload.get("date", "")).isoformat()
+        if bridge.call("progress", progress={"message": "저장 자료 영업 보정 재계산 중"})["stopRequested"]:
+            raise RuntimeError("Job stopped before business refresh")
+        state = manager.state()
+        if payload.get("revision") != state["revision"]:
+            raise ValueError("DB가 변경되었습니다. 새로고침 후 재계산해 주세요.")
+        entries = [e for e in state["entries"] if not e["archived"]]
+        valid = [e for e in entries if e.get("business_adjustment") and e["business_adjustment"]["date"] == day]
+        closed = sum(e["business_adjustment"]["assumed_closed"] for e in valid)
+        response = {"date": day, "normal": len(valid), "assumed_closed": closed}
+        return response, {"state": "completed", "completed": len(entries), "total": len(entries),
+            "normal": len(valid), "issues": len(entries)-len(valid),
+            "message": f"영업 보정 재계산 완료: {len(entries)}항목, 평일 미영업 추정 {closed}항목 · 원본 보존"}
     if kind in {"apply", "archive", "room-rules", "approve-review"}:
         if kind in {"apply", "approve-review"} and payload.get("collect_after"):
             from naver_room_booking_upgraded import parse_date

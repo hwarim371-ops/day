@@ -109,6 +109,23 @@ class CloudTests(unittest.TestCase):
         self.assertEqual(progress['total'], 1)
         self.assertEqual(len(self.manager.data['results']), 1)
 
+    def test_business_refresh_never_collects_or_edits_originals(self):
+        before_db = self.manager.store.db.read_bytes()
+        before_result = self.manager.store.result.read_bytes()
+        before_data = json.dumps(self.manager.data, sort_keys=True)
+        with patch.object(core, 'BrowserCollector', side_effect=AssertionError('No browser')):
+            result, progress = execute(FakeBridge(), self.manager, {'kind':'business-refresh', 'payload':{
+                'revision':self.manager.state()['revision'], 'date':'2026-11-15'}})
+        self.assertEqual(progress['completed'],3)
+        self.assertEqual(result['assumed_closed'],0)
+        self.assertEqual(before_db,self.manager.store.db.read_bytes())
+        self.assertEqual(before_result,self.manager.store.result.read_bytes())
+        self.assertEqual(before_data,json.dumps(self.manager.data,sort_keys=True))
+        with self.assertRaises(ValueError):
+            execute(FakeBridge(), self.manager, {'kind':'business-refresh','payload':{'revision':'old','date':'2026-11-15'}})
+        with self.assertRaises(RuntimeError):
+            execute(FakeBridge(stop=True), self.manager, {'kind':'business-refresh','payload':{'date':'2026-11-15'}})
+
     def test_apply_and_collect_uses_one_job_and_only_saved_keys(self):
         state = self.manager.state()
         edit = {**state['entries'][0], 'price': '65000'}

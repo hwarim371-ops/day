@@ -37,8 +37,9 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_key
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 from booking_pricing import nightly_max, only_price_changed
+from booking_business import POLICY, assess, valid_counts
 
-VERSION = "2.8.1"
+VERSION = "2.9.0"
 
 
 class Manager:
@@ -78,6 +79,7 @@ class Manager:
                 self.legacy = self.store.legacy_results()
                 self.legacy_stamp = time.monotonic()
             entries, rev = self.store.entries()
+            histories = self.store.histories()
             archived = set(self.store.meta["archived"])
             rows = []
             for e in entries:
@@ -109,11 +111,18 @@ class Manager:
                     "items_checked_at": catalog.get("checked_at") if catalog else None})
                 rows[-1]["room_authority"] = "manual" if self.manual_rooms(e) else "auto"
                 rows[-1]["price_policy"] = self.store.meta.get("price_policy", {}).get(key, {})
+                valid = (result and result.get("status") == "정상" and not result.get("stale")
+                         and not result.get("superseded") and not pending and key not in archived
+                         and valid_counts(result) and result["total"] == len(e.rooms))
+                amount = exact_price(e.price)
+                rows[-1]["business_adjustment"] = assess(histories.get(key, []), {
+                    **result, "revenue": result["reserved"] * amount if amount is not None else None
+                }) if valid else None
             order = read_json(self.order_path, {"keys": [], "revision": ""})
             return copy.deepcopy({"version": VERSION, "parser_version": PARSER_VERSION, "folder": str(self.store.folder), "today": date.today().isoformat(),
                 "display_order": order["keys"], "order_revision": order["revision"],
                 "revision": rev, "entries": rows, "job": self.job, "jobs": self.data["jobs"][:30],
-                "discoveries": self.data["discoveries"], "busy": self.busy()})
+                "discoveries": self.data["discoveries"], "business_policy": POLICY, "busy": self.busy()})
 
     def select(self, payload):
         entries, rev = self.store.entries()
@@ -797,7 +806,10 @@ def make_server(manager, port):
                         return self.send(200, {"history": manager.store.history(key)})
                 if path in {"/download/db", "/download/result"}:
                     file = manager.store.db if path.endswith("db") else manager.store.result
-                    return self.send(200, file.read_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    with manager.lock:
+                        from booking_business import workbook_bytes
+                        body = file.read_bytes() if path.endswith("db") else workbook_bytes(file, manager.state(), manager.store.histories())
+                    return self.send(200, body, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                 if path in {"/", "/app.js", "/style.css", "/lucide.min.js", "/favicon.svg"}:
                     file = SUPPORT / "web" / ("index.html" if path == "/" else path[1:])
                     body = file.read_bytes()
@@ -826,6 +838,12 @@ def make_server(manager, port):
                     result = {"message": "현재 항목 처리 후 중지합니다."}
                 elif path == "/api/apply":
                     result = manager.apply(data)
+                elif path == "/api/business-refresh":
+                    with manager.lock:
+                        if manager.busy() or data.get("revision") != manager.store.entries()[1]:
+                            raise ValueError("작업 종료 후 새로고침하고 다시 계산해 주세요.")
+                        manager.store.history_cache = None
+                        result = {"message": "저장 자료 영업 보정 재계산 완료"}
                 elif path == "/api/archive":
                     result = manager.archive(data)
                 elif path == "/api/list-order":

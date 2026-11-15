@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import copy
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
+from booking_business import annotate_history
 import naver_room_booking_upgraded as core
 
 
@@ -101,6 +103,7 @@ class Store:
         self.meta_path = self.home / "catalog.json"
         self.meta = read_json(self.meta_path, {"archived": [], "regions": {}, "changed": []})
         self.cache = None
+        self.history_cache = None
         with core.collection_run_lock(self.folder):
             self.recover()
 
@@ -139,18 +142,28 @@ class Store:
         atomic_json(self.meta_path, self.meta)
 
     def history(self, key):
-        entry = next((e for e in self.entries()[0] if entry_key(e) == key), None)
-        if not entry or not self.result.exists():
-            return []
+        return self.histories().get(key, [])
+
+    def histories(self):
+        entries, rev = self.entries()
+        if not self.result.exists():
+            return {entry_key(e): [] for e in entries}
+        stat = self.result.stat()
+        stamp = (rev, stat.st_mtime_ns, stat.st_size)
+        if self.history_cache and self.history_cache[0] == stamp:
+            return copy.deepcopy(self.history_cache[1])
         wb = load_workbook(self.result, read_only=True, data_only=True)
         try:
-            if entry.sheet_title not in wb.sheetnames:
-                return []
-            items = core.read_result_history_from_ws(wb[entry.sheet_title])
-            return [{"date": v["date_text"], "reserved": v["reserved"], "total": v["total"],
+            histories = {}
+            for entry in entries:
+                items = core.read_result_history_from_ws(wb[entry.sheet_title]) if entry.sheet_title in wb.sheetnames else []
+                rows = [{"date": v["date_text"], "reserved": v["reserved"], "total": v["total"],
                      "rate": v["reserved"] / v["total"] if v["total"] else None,
                      "price": v["price"], "revenue": (v["reserved"] * exact_price(v["price"]))
                      if exact_price(v["price"]) is not None else None} for v in items]
+                histories[entry_key(entry)] = annotate_history(rows)
+            self.history_cache = (stamp, histories)
+            return copy.deepcopy(histories)
         finally:
             wb.close()
 

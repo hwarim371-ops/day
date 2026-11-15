@@ -39,3 +39,13 @@ assert.equal(records[0].rate,1);
 assert.equal(records[0].revenue,100000);
 assert.equal(records[1].revenue,null);
 console.log('PASS same-date history deduplication, weighted inputs, invalid date/count exclusion, missing revenue not zero');
+const full = {...entry, result:{...entry.result,reserved:2}, business_adjustment:{policy_version:'weekday-off-v1',
+  date:'2026-09-27', assumed_closed:true, day_type:'weekday', reason:'weekday_full'}};
+assert.equal(ctx.businessValue(full).revenue,0);
+assert.equal(ctx.businessValue(full).total,0);
+assert.equal(ctx.businessValue(full).rate,null);
+assert.equal(ctx.businessValue(full,'raw').revenue,100000);
+assert.equal(ctx.businessValue({...full,result:{...full.result,stale:true}}).revenue,null);
+assert.equal(ctx.businessValue({...full,business_adjustment:{...full.business_adjustment,date:'2026-09-26'}}).revenue,100000);
+assert.equal(ctx.businessValue({...full,business_adjustment:{...full.business_adjustment,day_type:'weekend'}}).revenue,100000);
+console.log('PASS adjusted/raw comparison, closed-day denominator, stale and mismatched policy exclusion');
