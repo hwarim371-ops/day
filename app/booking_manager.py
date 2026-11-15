@@ -371,7 +371,7 @@ class Manager:
                                 other_keys, other_snapshot.get("roomAliases"))[0] for k in other_keys]
                             if set(matched_ids) & {item_key(c) for c in other_cards if c is not None}:
                                 result.status = "분류 간 동일 상품 중복: 객실 배정 확인 필요"
-                        if kind == "collect" and result.status == "정상":
+                        if kind == "collect" and result.matched_count > 0 and "중복" not in result.status:
                             e = self._refresh_price(e, collector)
                             result.entry = e
                             proposal["revision"] = rev = self.store.entries()[1]

@@ -171,6 +171,21 @@ class PricingIntegration(unittest.TestCase):
         self.collect(UntypedCollector)
         self.assertEqual(self.m.state()["entries"][0]["price"], "80000")
 
+    def test_price_does_not_turn_partial_room_matching_into_success(self):
+        class PartialCollector(FakeCollector):
+            def get_snapshot(self, company):
+                url, snapshot = super().get_snapshot(company)
+                snapshot["roomCards"] = [c for c in snapshot["roomCards"] if c["title"] != "A-2"]
+                return url, snapshot
+            def get_price_snapshot(self, company):
+                return "", {"listingStable": True, "roomCards": [card("A-1", "80000원")]}
+        self.collect(PartialCollector)
+        row = self.m.state()["entries"][0]
+        self.assertEqual(row["price"], "80000")
+        self.assertEqual(row["result"]["missing"], 1)
+        self.assertNotEqual(row["result"]["status"], "정상")
+        self.assertEqual(self.m.store.history(row["key"])[-1]["date"], "2026-08-01")
+
     def test_price_save_failure_rolls_back_workbooks_and_policy(self):
         import os
         self.collect()
