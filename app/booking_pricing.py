@@ -9,8 +9,11 @@ PRICE_LINE = re.compile(
     r"(?:\s*(?:Npay|네이버페이)\s*\+?)?", re.I)
 
 
-def nightly_max(card):
-    if classify(card)[0] != "room":
+def nightly_max(card, *, confirmed_room=False):
+    decision, reason = classify(card)
+    missing_type = (confirmed_room and card.get("unitEvidence")
+                    and reason == "숙박·캠핑사이트 근거 부족")
+    if decision != "room" and not missing_type:
         return None
     text = str(card.get("text", ""))
     title = str(card.get("title", ""))

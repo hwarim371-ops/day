@@ -38,7 +38,7 @@ from room_classifier import PARSER_VERSION, filtered_snapshot, partition, item_k
 from room_reconcile import exact_bindings, plan_changes, catalog_signature
 from booking_pricing import nightly_max, only_price_changed
 
-VERSION = "2.8.0"
+VERSION = "2.8.1"
 
 
 class Manager:
@@ -452,17 +452,20 @@ class Manager:
                 self.log(f"{entry.sheet_title}: 가격 목록 미확인 · 기존 금액 유지")
                 return entry
             scoped = self.entry_snapshot(entry, snapshot)
-            filtered, _ = filtered_snapshot(scoped, scoped["roomRules"])
+            filtered, price_groups = filtered_snapshot(scoped, scoped["roomRules"])
+            # Some undated listings omit the room type; use only already-matched DB units.
+            price_cards = filtered["roomCards"] + [c for c in price_groups["review"]
+                if c.get("reason") == "숙박·캠핑사이트 근거 부족" and c.get("unitEvidence")]
             keys = core.normalized_room_list(entry.rooms)
-            cards = [core.choose_best_room_card(k, filtered["roomCards"], [], keys,
+            cards = [core.choose_best_room_card(k, price_cards, [], keys,
                      scoped.get("roomAliases"))[0] for k in keys]
             ids = [item_key(c) for c in cards if c is not None]
             if len(ids) != len(set(ids)):
                 return entry
-            priced = [(nightly_max(c), c) for c in cards if c is not None]
+            priced = [(nightly_max(c, confirmed_room=True), c) for c in cards if c is not None]
             priced = [(amount, c) for amount, c in priced if amount is not None]
             if not priced:
-                self.log(f"{entry.sheet_title}: 표시 가격 없음 · 기존 금액 유지")
+                self.log(f"{entry.sheet_title}: 가격 추출 미확인 · 기존 금액 유지")
                 return entry
             amount, source = max(priced, key=lambda pair: pair[0])
             policy = {"mode": "auto_max", "amount": amount, "checked_at": now(),

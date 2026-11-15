@@ -48,6 +48,15 @@ class PriceParsing(unittest.TestCase):
                               ("쿠폰", ""), ("(2박) 사이트-6", "최소 2박"), ("A-1", "최소 3박")]:
             self.assertIsNone(nightly_max(card(title, "200,000원", detail)))
 
+    def test_known_room_can_omit_type_but_not_unit_or_day_use_evidence(self):
+        known = card("A8", "70,000 ~\n부터\n80,000원", "", schemaVersion=3,
+                     unitEvidence=True, overnightEvidence=False)
+        self.assertIsNone(nightly_max(known))
+        self.assertEqual(nightly_max(known, confirmed_room=True), 80000)
+        self.assertIsNone(nightly_max({**known, "unitEvidence": False}, confirmed_room=True))
+        self.assertIsNone(nightly_max({**known, "title": "캠크닉"}, confirmed_room=True))
+        self.assertIsNone(nightly_max({**known, "title": "쿠폰"}, confirmed_room=True))
+
 
 class PricingIntegration(unittest.TestCase):
     def setUp(self):
@@ -152,6 +161,15 @@ class PricingIntegration(unittest.TestCase):
                 return "", {"listingStable": True, "roomCards": [card("A-1", "예약마감")]}
         self.collect(EmptyCollector)
         self.assertEqual(self.m.state()["entries"][0]["price"], "5만원")
+
+    def test_known_dated_room_with_untyped_undated_price(self):
+        class UntypedCollector(FakeCollector):
+            def get_price_snapshot(self, company):
+                return "", {"listingStable": True, "roomCards": [
+                    card("A-1", "70000~80000원", "", schemaVersion=3,
+                         unitEvidence=True, overnightEvidence=False)]}
+        self.collect(UntypedCollector)
+        self.assertEqual(self.m.state()["entries"][0]["price"], "80000")
 
     def test_price_save_failure_rolls_back_workbooks_and_policy(self):
         import os
