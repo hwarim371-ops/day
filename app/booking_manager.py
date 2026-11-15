@@ -170,6 +170,8 @@ class Manager:
                              + f", 이름 추적 {counts.get('renamed', 0)}개, 신규 {counts.get('added', 0)}개"
                              + f", 집계 대상 제외 {counts.get('excluded', 0)}개"
                              + f", 임시 보관 {counts.get('inactive', 0)}개, 자동 복원 {counts.get('restored', 0)}개")
+                if kind == "collect":
+                    self.log(self.job["message"] + f" · 표시 최고가 반영 {len(self.job.get('price_updates', []))}항목")
         except Exception as exc:
             with self.lock:
                 self.job["state"] = "failed"
