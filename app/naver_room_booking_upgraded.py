@@ -964,7 +964,7 @@ EXTRACT_SCRIPT = r"""
           itemKey: productKey,
           itemUrl: links[0] ? links[0].href : '',
           unitEvidence: true,
-          overnightEvidence: /최소\s*\d+\s*박|\d+\s*박|침실|침대|캠핑사이트|파쇄석|일반노지|글램핑|카라반/.test(text),
+          overnightEvidence: /최소\s*\d+\s*박|\d+\s*박|침실|침대|캠핑사이트|파쇄석|일반노지|글램핑|카라반|일반객실|독채|온돌룸/.test(text),
           priceAmount: prices.length === 1 ? prices[0] : null,
           statusLabels: [...new Set(statuses)],
           title,
