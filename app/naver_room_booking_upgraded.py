@@ -19,6 +19,7 @@ from typing import Callable, Iterable
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from room_classifier import filtered_snapshot, partition
+from room_stays import MAX_NIGHTS, combine_stays, required_stays, unit_title
 
 
 APP_TITLE = "네이버 객실 예약현황 자동화 Upgrade"
@@ -725,8 +726,10 @@ def read_result_history(folder: Path, sheet_title: str) -> list[dict[str, object
     return read_result_history_from_ws(wb[sheet_title])
 
 
-def build_naver_room_url(company_id: str, checkin: date) -> str:
-    checkout = checkin + timedelta(days=1)
+def build_naver_room_url(company_id: str, checkin: date, nights: int = 1) -> str:
+    if type(nights) is not int or not 1 <= nights <= MAX_NIGHTS:
+        raise ValueError("숙박기간은 1~7박이어야 합니다.")
+    checkout = checkin + timedelta(days=nights)
     return (
         f"https://m.place.naver.com/accommodation/{company_id}/room"
         f"?entry=pll&businessCategory=camping&level=top&guest=1"
@@ -967,6 +970,8 @@ EXTRACT_SCRIPT = r"""
           overnightEvidence: /최소\s*\d+\s*박|\d+\s*박|침실|침대|캠핑사이트|파쇄석|일반노지|글램핑|카라반|일반객실|독채|온돌룸/.test(text),
           priceAmount: prices.length === 1 ? prices[0] : null,
           statusLabels: [...new Set(statuses)],
+          availabilityEvidence: statuses.length === 0 && text.split('\n').some(t =>
+            /^[\d,]+\s*(?:원\s*)?(?:[~～–-]\s*[\d,]+\s*)?원(?:\s*(?:Npay|네이버페이)\s*\+?)?$/i.test(t.trim())),
           title,
           titleKey,
           text,
@@ -990,6 +995,8 @@ EXTRACT_SCRIPT = r"""
     bodyText: bodyText.slice(0, 8000),
     candidates,
     roomCards,
+    selectedStayText: Array.from(document.querySelectorAll('button,a,[role="button"]'))
+      .filter(isVisible).map(textOf).find(t => /\d+월\s*\d+일[\s\S]*부터[\s\S]*\d+월\s*\d+일[\s\S]*까지/.test(t)) || '',
     roomEvidenceFiltered: true,
     strictRoomCards: true,
     pendingListing: Array.from(document.querySelectorAll("[aria-busy='true'],button,a")).some(el =>
@@ -1035,6 +1042,12 @@ class BrowserCollector:
         self._timeout_error = None
         self._snapshots: dict[str, dict] = {}
         self._price_snapshots: dict[str, dict] = {}
+        self._known_catalogs = {}
+        self._room_rules = {}
+
+    def configure_stays(self, catalogs, rules):
+        self._known_catalogs = catalogs
+        self._room_rules = rules
 
     def __enter__(self) -> "BrowserCollector":
         sync_playwright, timeout_error = import_playwright()
@@ -1080,6 +1093,23 @@ class BrowserCollector:
         url = build_naver_room_url(company_id, self.checkin)
         self.progress(f"[{log_time()}] 접속: {company_id}")
         snapshot = self._read_snapshot(url)
+        known = self._known_catalogs.get(company_id, {}).get("snapshot", {}).get("roomCards", [])
+        durations = required_stays(snapshot.get("roomCards", []) + known, self._room_rules.get(company_id))
+        if durations:
+            views = {1: snapshot}
+            for nights in durations:
+                if nights > MAX_NIGHTS:
+                    continue
+                self.progress(f"{company_id}: {nights}박 상품 전용 일정 조회")
+                try:
+                    views[nights] = self._read_snapshot(build_naver_room_url(company_id, self.checkin, nights))
+                except Exception as exc:
+                    if "접근 제한" in str(exc) or "접근이 제한" in str(exc):
+                        raise
+                    views[nights] = {"roomCards": [], "listingStable": False}
+                    self.progress(f"{company_id}: {nights}박 조회 실패 · 미확인 유지")
+            snapshot = combine_stays(snapshot, views, self.checkin, self.status_words, known,
+                                     self._room_rules.get(company_id))
         self._snapshots[company_id] = snapshot
         return url, snapshot
 
@@ -1272,11 +1302,12 @@ def choose_best_room_card(
 ) -> tuple[dict | None, bool]:
     identity = (aliases or {}).get(room_key.casefold())
     if identity:
-        identified = [c for c in room_cards if c.get("itemKey") == identity]
+        identified = [c for c in room_cards if c.get("itemKey") == identity or identity in c.get("memberItemKeys", [])]
         if len(identified) == 1:
             card = identified[0]
             reserved = any(normalize_name(label) in status_words for label in card.get("statusLabels", []))
             return card, reserved
+    room_key = normalize_name(unit_title(room_key))
     scored = []
     for card in room_cards:
         title_key = card.get("titleKey") or normalize_name(card.get("title"))
@@ -1409,6 +1440,9 @@ def analyze_entry_snapshot(entry: DbEntry, snapshot: dict, status_words: list[st
     for room in entry.rooms:
         room_key = normalize_name(room)
         card, reserved = choose_best_room_card(room_key, room_cards, status_words, room_keys, snapshot.get("roomAliases"))
+        if card and card.get("availabilityState") == "unknown":
+            matches.append(RoomMatch(room, False, False, "숙박기간별 예약상태 미확인"))
+            continue
         if card:
             evidence = " ".join((card.get("text") or card.get("title") or "").split())
             matches.append(RoomMatch(room, True, reserved, evidence[:300]))
@@ -1443,6 +1477,9 @@ def analyze_entry_snapshot(entry: DbEntry, snapshot: dict, status_words: list[st
         status = f"일부 매칭 실패 {len(missing)}개, DB후보 {len(detected_rooms)}개"
     else:
         status = "정상"
+    unknown_stays = sum(m.evidence == "숙박기간별 예약상태 미확인" for m in matches)
+    if unknown_stays:
+        status += f" · 숙박기간별 예약상태 미확인 {unknown_stays}개"
 
     return EntryResult(
         entry=entry,

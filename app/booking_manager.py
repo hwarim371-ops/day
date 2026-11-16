@@ -39,7 +39,7 @@ from room_reconcile import exact_bindings, plan_changes, catalog_signature
 from booking_pricing import nightly_max, only_price_changed
 from booking_business import POLICY, assess, valid_counts
 
-VERSION = "2.9.1"
+VERSION = "2.10.0"
 
 
 class Manager:
@@ -336,6 +336,9 @@ class Manager:
                 wb.active.title = core.STATUS_SHEET_NAME
         try:
             with core.BrowserCollector(checkin, words, False, 25, self.log) as collector:
+                configure = getattr(collector, "configure_stays", None)
+                if configure:
+                    configure(previous_catalogs, {e.company_id: self.rules(e.company_id) for e in entries})
                 for e in entries:
                     if self.stop.is_set():
                         break
@@ -348,6 +351,8 @@ class Manager:
                         if e.company_id not in reported_companies:
                             self.job["auto_changes"]["excluded"] += len(partition(snapshot, self.rules(e.company_id))["excluded"])
                             reported_companies.add(e.company_id)
+                            for unit in snapshot.get("staySummary", []):
+                                self.log(f"{e.major} / {unit['title']}: 숙박상품 {unit['products']}개 → 실물 1개 · {unit['detail']}")
                         with self.lock:
                             self.data["catalogs"][e.company_id] = {"snapshot": {"roomCards": snapshot.get("roomCards", []), "strictRoomCards": True}, "checked_at": now()}
                         proposal = self._proposal(e, snapshot, rev)
@@ -394,7 +399,9 @@ class Manager:
                                     "checked_at": now(), "date": checkin.isoformat(), "fingerprint": fingerprint(e),
                                     "parser_version": PARSER_VERSION, "rules_revision": self.rules_revision(e.company_id),
                                     "excluded_items": proposal["excluded"], "review_items": proposal["review"],
-                                    "diagnosis": changes}
+                                    "diagnosis": changes,
+                                    "stay_units": [dict(title=c["title"], state=c["availabilityState"],
+                                        evidence=c["stayEvidence"]) for c in matches if c and c.get("stayEvidence")]}
                                 attempted_keys.append(key)
                             self.job["completed"] += 1
                             self.job["normal" if result.status == "정상" else "issues"] += 1

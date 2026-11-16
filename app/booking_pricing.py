@@ -2,6 +2,7 @@
 import re
 
 from room_classifier import classify
+from room_stays import stay_length
 
 NUMBER = r"(?:\d{1,3}(?:,\d{3})+|\d+)"
 PRICE_LINE = re.compile(
@@ -21,9 +22,19 @@ def nightly_max(card, *, confirmed_room=False):
     if decision != "room" and not missing_type:
         return None
     text = str(card.get("text", ""))
-    # A two-night package is not a nightly tariff.
-    nights = re.findall(r"최소\s*(\d+)\s*박|\((\d+)박\)", text + "\n" + title)
-    if any(int(a or b) > 1 for a, b in nights):
+    for line in text.splitlines():
+        nightly = re.fullmatch(r"\s*1박\s*(?:당|기준|요금|가격)?\s*[:：]?\s*(.+)", line)
+        total = re.fullmatch(r"\s*(\d+)박\s*(?:총요금|총액|합계)\s*[:：]?\s*(.+)", line)
+        explicit = nightly or total
+        if explicit:
+            price = PRICE_LINE.fullmatch(explicit.groups()[-1].strip())
+            if price:
+                amount = max(int(v.replace(",", "")) for v in price.groups() if v)
+                nights = int(total.group(1)) if total else 1
+                if amount > 0 and 1 <= nights <= 7 and amount % nights == 0:
+                    return amount // nights
+    # Unlabelled multi-night prices are neither assumed nightly nor divided blindly.
+    if stay_length(card) > 1:
         return None
     for line in text.splitlines():
         match = PRICE_LINE.fullmatch(line.strip())

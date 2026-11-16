@@ -48,6 +48,13 @@ class PriceParsing(unittest.TestCase):
                               ("쿠폰", ""), ("(2박) 사이트-6", "최소 2박"), ("A-1", "최소 3박")]:
             self.assertIsNone(nightly_max(card(title, "200,000원", detail)))
 
+    def test_explicit_multi_night_price_units(self):
+        self.assertEqual(nightly_max(card("(2박) 사이트-6", "1박 기준: 80000원", "최소 2박")), 80000)
+        self.assertEqual(nightly_max(card("(2박) 사이트-6", "2박 총액: 140000~160000원", "최소 2박")), 80000)
+        self.assertIsNone(nightly_max(card("[2박] 사이트-6", "160000원", "")))
+        self.assertIsNone(nightly_max(card("(2박) 사이트-6", "2박 총액: 160001원", "최소 2박")))
+        self.assertIsNone(nightly_max(card("쿠폰", "1박 기준: 80000원")))
+
     def test_known_room_can_omit_type_but_not_unit_or_day_use_evidence(self):
         known = card("A8", "70,000 ~\n부터\n80,000원", "", schemaVersion=3,
                      unitEvidence=True, overnightEvidence=False)
