@@ -16,7 +16,7 @@ from booking_manager import Manager
 import booking_file_lock
 import naver_room_booking_upgraded as core
 from cloud.snapshot import digest, pack, unpack, FILES
-from cloud.runner import Bridge, envelope, execute, run
+from cloud.runner import Bridge, BridgeRequestError, envelope, execute, run
 from cloud.build import APP_FILES, web_html
 
 JOB = '9d5db4ef-5c77-4e4c-a461-165c239545ec'
@@ -182,10 +182,39 @@ class CloudTests(unittest.TestCase):
 
     def test_terminal_claim_never_repeats_collection(self):
         bridge = FakeBridge()
-        bridge.call = lambda *args, **kwargs: {'terminal': True}
+        bridge.call = lambda *args, **kwargs: {'terminal': True, 'saved': True, 'state': 'completed'}
         with patch('booking_manager.Manager') as factory:
             run(bridge)
             factory.assert_not_called()
+
+    def test_unsaved_terminal_claim_is_not_reported_as_success(self):
+        for state in ['failed', 'interrupted', 'stopped', 'completed', None]:
+            bridge = FakeBridge()
+            bridge.call = lambda *args, **kwargs: {'terminal': True, 'state': state, 'saved': False}
+            with patch('booking_manager.Manager') as factory:
+                with self.assertRaises(BridgeRequestError) as error:
+                    run(bridge)
+                self.assertEqual(error.exception.code, 'JOB_NOT_COMPLETED')
+                factory.assert_not_called()
+
+    def test_work_start_is_acknowledged_before_execute(self):
+        bundle = pack(self.manager)
+        bridge = FakeBridge()
+        def call(action, **kwargs):
+            bridge.calls.append((action, kwargs))
+            if action == 'claim':
+                return {'lease': 'test', 'bundle': base64.b64encode(bundle).decode(),
+                        'sha256': digest(bundle), 'job': {'kind': 'collect', 'payload': {}}}
+            if action == 'progress':
+                return {'stopRequested': False}
+            return {'saved': True}
+        bridge.call = call
+        def work(*args):
+            self.assertEqual([x[0] for x in bridge.calls], ['claim', 'progress'])
+            return {}, {'state': 'completed', 'completed': 1, 'total': 1}
+        with patch('cloud.runner.execute', side_effect=work):
+            run(bridge)
+        self.assertEqual([x[0] for x in bridge.calls], ['claim', 'progress', 'progress', 'commit'])
 
     def test_lock_contention(self):
         path = self.folder / 'lock'

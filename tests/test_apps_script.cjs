@@ -229,6 +229,96 @@ test('monitor service errors never mark a live job failed', () => {
   const h = harness(), {id} = h.start(); h.monitorCode(403);
   h.context.monitorActiveJob_(); assert.equal(h.context.findJob_(id).state, 'queued');
 });
+test('a verified long GitHub queue survives polling and permits a late claim', () => {
+  const h = harness(), {id} = h.start();
+  h.githubRun({id: 100, display_title: 'Camping job ' + id, status: 'queued', conclusion: null});
+  h.advance(37 * 60000); h.context.monitorActiveJob_();
+  assert.equal(h.context.uiRequest('/api/state').value.job.state, 'queued');
+  assert.match(h.context.findJob_(id).message, /37분/);
+  assert.equal(h.claim(id).ok, true);
+  assert.equal(h.context.findJob_(id).state, 'running');
+});
+test('long queue cannot be kept alive forever by GitHub monitoring', () => {
+  const h = harness(), {id} = h.start();
+  h.githubRun({id: 100, display_title: 'Camping job ' + id, status: 'queued', conclusion: null});
+  h.advance(121 * 60000); h.context.monitorActiveJob_();
+  assert.equal(h.context.findJob_(id).state, 'interrupted');
+  assert.equal(h.claim(id).value.saved, false);
+});
+test('unverified queue has a bounded 45 minute fallback', () => {
+  const h = harness(), {id} = h.start(); h.monitorCode(503);
+  h.advance(37 * 60000); h.context.monitorActiveJob_();
+  assert.equal(h.context.findJob_(id).state, 'queued');
+  h.advance(9 * 60000); h.context.monitorActiveJob_();
+  assert.equal(h.context.findJob_(id).state, 'interrupted');
+});
+test('scheduled collection never starts for yesterday after midnight', () => {
+  const h = harness(); h.setClock('2026-11-16T23:50:00+09:00');
+  const {job_id: id} = h.context.scheduledDailyCollection_();
+  h.advance(11 * 60000);
+  assert.equal(h.claim(id).value.state, 'interrupted');
+  assert.equal(h.props.get('DAILY_COLLECTION_DATE'), '2026-11-16');
+});
+test('pre-start GitHub failure retries once with a new id and fences the old runner', () => {
+  const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+  const {job_id: first} = h.context.scheduledDailyCollection_();
+  const pointer = h.props.get('CURRENT_MANIFEST_ID');
+  h.githubRun({id: 100, display_title: 'Camping job ' + first, status: 'completed', conclusion: 'failure'});
+  h.advance(120000); h.context.scheduledDailyCollection_();
+  const second = h.props.get('ACTIVE_JOB_ID');
+  assert.notEqual(second, first); assert.equal(h.dispatchCount(), 2);
+  assert.equal(h.context.findJob_(second).retry_count, 1);
+  assert.equal(h.context.findJob_(second).scheduled_date, '2026-11-16');
+  assert.equal(h.claim(first).value.saved, false);
+  assert.equal(h.context.findJob_(first).retry_job_id, second);
+  h.githubRun({id: 101, display_title: 'Camping job ' + second, status: 'completed', conclusion: 'failure'});
+  h.advance(120000); h.context.scheduledDailyCollection_();
+  h.advance(120000); h.context.scheduledDailyCollection_();
+  assert.equal(h.dispatchCount(), 2); assert.equal(h.props.get('ACTIVE_JOB_ID'), undefined);
+  assert.equal(h.props.get('CURRENT_MANIFEST_ID'), pointer);
+});
+test('work that started is never retried even with zero completed rooms', () => {
+  const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+  const {job_id: id} = h.context.scheduledDailyCollection_(), lease = h.claim(id).value.lease;
+  h.action(id, lease, 'progress', {progress: {completed: 0}});
+  h.githubRun({id: 100, status: 'completed', conclusion: 'failure'});
+  h.context.monitorActiveJob_();
+  assert.equal(h.dispatchCount(), 1); assert.equal(h.context.findJob_(id).state, 'failed');
+});
+test('transient startup failure waits for runner termination before one retry', () => {
+  const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+  const {job_id: id} = h.context.scheduledDailyCollection_();
+  h.post({action: 'startup_fail', job_id: id, execution: '100:1', code: 'TIMEOUT'});
+  h.context.uiRequest('/api/state');
+  assert.equal(h.props.get('STARTUP_RETRY_JOB_ID'), id);
+  h.githubRun({id: 100, status: 'in_progress'}); h.context.monitorActiveJob_();
+  assert.equal(h.dispatchCount(), 1);
+  h.githubRun({id: 100, status: 'completed', conclusion: 'failure'}); h.context.monitorActiveJob_();
+  assert.equal(h.dispatchCount(), 2); assert.equal(h.props.get('STARTUP_RETRY_JOB_ID'), undefined);
+});
+test('authorization failure, cancellation and apparent success are not retried', () => {
+  for (const code of ['AUTH_REJECTED', 'HTTP_401', 'HTTP_403', 'TLS_ERROR']) {
+    const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+    const {job_id: id} = h.context.scheduledDailyCollection_();
+    h.post({action: 'startup_fail', job_id: id, execution: '100:1', code});
+    h.githubRun({id: 100, status: 'completed', conclusion: 'failure'}); h.context.monitorActiveJob_();
+    assert.equal(h.dispatchCount(), 1); assert.equal(h.props.get('STARTUP_RETRY_JOB_ID'), undefined);
+  }
+  for (const conclusion of ['cancelled', 'success']) {
+    const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+    const {job_id: id} = h.context.scheduledDailyCollection_();
+    h.githubRun({id: 100, display_title: 'Camping job ' + id, status: 'completed', conclusion});
+    h.context.monitorActiveJob_(); assert.equal(h.dispatchCount(), 1);
+  }
+});
+test('new manual job cancels pending startup recovery', () => {
+  const h = harness(); h.setClock('2026-11-16T22:00:00+09:00');
+  const {job_id: id} = h.context.scheduledDailyCollection_();
+  h.post({action: 'startup_fail', job_id: id, execution: '100:1', code: 'TIMEOUT'});
+  h.start(); assert.equal(h.props.get('STARTUP_RETRY_JOB_ID'), undefined);
+  h.githubRun({id: 100, status: 'completed', conclusion: 'failure'}); h.context.monitorActiveJob_();
+  assert.equal(h.dispatchCount(), 2);
+});
 test('monitor respects stop and published snapshots even if GitHub failed afterward', () => {
   const h = harness(), {id} = h.start(), lease = h.claim(id).value.lease;
   const old = h.context.findJob_(id);

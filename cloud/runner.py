@@ -188,19 +188,26 @@ def run(bridge):
             print("Startup failure could not reach Drive; the cloud monitor will check this run.", flush=True)
         raise
     if claim.get("terminal"):
-        print("Job already finished; no collection repeated.")
-        return
+        if claim.get("saved") is True and claim.get("state") in {"completed", "issues"}:
+            print("Job snapshot already saved; no collection repeated.")
+            return
+        raise BridgeRequestError("Job ended without a successful saved snapshot.", "JOB_NOT_COMPLETED", "claim")
     bridge.lease = claim["lease"]
     try:
         with tempfile.TemporaryDirectory(prefix="camping-job-") as temp:
             unpack(base64.b64decode(claim["bundle"], validate=True), temp, claim["sha256"])
             manager = Manager(temp)
+            # Persist the no-retry boundary before any browser or DB operation.
+            if bridge.call("progress", progress={"state": "running", "message": "작업 시작 확인 · 수집 준비 중"})["stopRequested"]:
+                raise RuntimeError("Job stopped before execution")
             response, progress = execute(bridge, manager, claim["job"])
             bridge.call("progress", progress={**progress, "message": "Google Drive에 결과 저장 중"})
             bundle = pack(manager)
             result = bridge.call("commit", bundle=base64.b64encode(bundle).decode(), sha256=digest(bundle), response=response, progress=progress)
             if not result.get("saved"):
                 raise RuntimeError("Drive did not confirm the saved snapshot")
+            if progress.get("state") not in {"completed", "issues"}:
+                raise RuntimeError("Job stopped; partial snapshot saved but collection was not completed")
             print(f"Drive snapshot saved. Outcome: {progress['state']}; processed {progress.get('completed', 0)}/{progress.get('total', 0)}.")
     except Exception as exc:
         try:
