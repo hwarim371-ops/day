@@ -13,7 +13,7 @@ function harness() {
   const props = new Map(), files = new Map(), cache = new Map(), triggers = [];
   let counter = 0, clock = Date.now(), failCreate = false, failJobWrite = false, dispatchCode = 204, dispatches = 0;
   let lockBusy = false, lockHeld = false;
-  let githubRun = null, monitorCode = 200, monitorReads = 0;
+  let githubRun = null, monitorCode = 200, monitorReads = 0, dispatchDetails = {};
   const reads = [], errors = [];
   class Blob {
     constructor(bytes, type = '', name = '') { this.bytes = Buffer.from(bytes); this.type = type; this.name = name; }
@@ -81,7 +81,10 @@ function harness() {
       }
     },
     UrlFetchApp: {fetch: (url, options) => {
-      if (options.method === 'post') {dispatches++; return {getResponseCode: () => dispatchCode};}
+      if (options.method === 'post') {
+        assert.equal(JSON.parse(options.payload).return_run_details, true);
+        dispatches++; return {getResponseCode: () => dispatchCode, getContentText: () => JSON.stringify(dispatchDetails)};
+      }
       assert.equal(lockHeld, false); monitorReads++;
       return {getResponseCode: () => monitorCode, getContentText: () => JSON.stringify(
         url.includes('?') ? {workflow_runs: githubRun ? [githubRun] : []} : githubRun)};
@@ -109,7 +112,7 @@ function harness() {
     dispatchCode: value => dispatchCode = value, dispatchCount: () => dispatches,
     lockBusy: value => lockBusy = value, reads, errors,
     githubRun: value => githubRun = value, monitorCode: value => monitorCode = value,
-    monitorReads: () => monitorReads};
+    monitorReads: () => monitorReads, dispatchDetails: value => dispatchDetails = value};
 }
 
 let tests = 0;
@@ -237,6 +240,21 @@ test('a verified long GitHub queue survives polling and permits a late claim', (
   assert.match(h.context.findJob_(id).message, /37분/);
   assert.equal(h.claim(id).ok, true);
   assert.equal(h.context.findJob_(id).state, 'running');
+});
+test('dispatch run id tracks a queue before its dynamic title is available', () => {
+  const h = harness(); h.dispatchCode(200); h.dispatchDetails({workflow_run_id: 100});
+  const {id} = h.start();
+  assert.equal(h.context.findJob_(id).github_run_id, '100');
+  h.githubRun({id: 100, display_title: 'Camping cloud job', status: 'queued', conclusion: null});
+  h.advance(55 * 60000); h.context.monitorActiveJob_();
+  assert.equal(h.context.uiRequest('/api/state').value.job.state, 'queued');
+  assert.equal(h.claim(id).ok, true);
+});
+test('unexpected dispatch detail response never sends a duplicate request', () => {
+  const h = harness(); h.dispatchCode(200); h.dispatchDetails({workflow_run_id: 'invalid'});
+  const {id} = h.start();
+  assert.equal(h.context.findJob_(id).github_run_id, undefined);
+  assert.equal(h.dispatchCount(), 1);
 });
 test('long queue cannot be kept alive forever by GitHub monitoring', () => {
   const h = harness(), {id} = h.start();

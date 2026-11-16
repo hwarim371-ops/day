@@ -293,7 +293,7 @@ function dispatch_(kind, payload, requestId, origin) {
     const response = UrlFetchApp.fetch('https://api.github.com/repos/' + repo + '/actions/workflows/collect.yml/dispatches', {
       method: 'post', contentType: 'application/json', muteHttpExceptions: true,
       headers: {Authorization: 'Bearer ' + token, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'},
-      payload: JSON.stringify({ref: branch, inputs: {job_id: job.id,
+      payload: JSON.stringify({ref: branch, return_run_details: true, inputs: {job_id: job.id,
         needs_browser: String(!['apply', 'archive', 'room-rules', 'approve-review', 'business-refresh'].includes(kind) || (['apply', 'approve-review'].includes(kind) && payload.collect_after === true))}})
     });
     if (![200, 204].includes(response.getResponseCode())) {
@@ -301,6 +301,15 @@ function dispatch_(kind, payload, requestId, origin) {
       saveJob_(job);
       props_().deleteProperty('ACTIVE_JOB_ID');
       throw new Error(job.message);
+    }
+    if (response.getResponseCode() === 200) {
+      const details = JSON.parse(response.getContentText());
+      if (Number.isSafeInteger(details.workflow_run_id) && details.workflow_run_id > 0) {
+        job.github_run_id = String(details.workflow_run_id);
+        job.github_status = 'queued';
+        job.github_checked_at = iso_();
+        saveJob_(job);
+      }
     }
   } catch (error) {
     if (job.state !== 'failed') {
