@@ -39,7 +39,7 @@ from room_reconcile import exact_bindings, plan_changes, catalog_signature
 from booking_pricing import nightly_max, only_price_changed
 from booking_business import POLICY, assess, valid_counts
 
-VERSION = "2.10.1"
+VERSION = "2.11.0"
 
 
 class Manager:

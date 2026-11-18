@@ -645,7 +645,8 @@ def write_status_sheet(wb, entries: list[DbEntry]) -> None:
         if sheet_name in RESULT_META_SHEETS or sheet_name in active_titles:
             continue
         ws_old = wb[sheet_name]
-        if ws_old.max_row <= 1 and ws_old.max_column <= 1 and ws_old["A1"].value is None:
+        from company_report import generated
+        if generated(ws_old) or (ws_old.max_row <= 1 and ws_old.max_column <= 1 and ws_old["A1"].value is None):
             continue
         latest = latest_history_item(wb, sheet_name)
         reserved = safe_int(latest["reserved"]) if latest else 0
@@ -703,7 +704,8 @@ def read_status_rows(folder: Path) -> list[dict[str, object]]:
         if sheet_name in RESULT_META_SHEETS or sheet_name in entry_by_title:
             continue
         ws = wb[sheet_name]
-        if ws.max_row <= 1 and ws.max_column <= 1 and ws["A1"].value is None:
+        from company_report import generated
+        if generated(ws) or (ws.max_row <= 1 and ws.max_column <= 1 and ws["A1"].value is None):
             continue
         rows.append(
             {

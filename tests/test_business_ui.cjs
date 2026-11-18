@@ -53,3 +53,15 @@ for (const change of [{policy_version:'weekday-off-v1'},{reason:'weekday_full'},
   {weekday_rate:.99999},{weekend_rate:1},{weekend_rate:null},{sufficient:false}])
   assert.equal(ctx.businessValue({...full,business_adjustment:{...full.business_adjustment,...change}}).revenue,100000);
 console.log('PASS adjusted/raw comparison, strict full-weekday pattern, legacy/day-only/rounded/insufficient exclusion');
+const es = [{...entry,key:'a',company_id:'1'}, {...entry,key:'b',company_id:'1'}, {...entry,key:'c',company_id:'2'}, {...entry,key:'z',company_id:'1',archived:true}];
+assert.deepEqual(Array.from(ctx.companies(es).values(), g=>g.length), [2,1]);
+const inputs = [[{date:'2026-09-01',reserved:1,total:1,revenue:480000}],
+  [{date:'2026-09-01',reserved:0,total:2,revenue:0},{date:'2026-09-02',reserved:1,total:2,revenue:null}]].map(ctx.cleanHistory);
+const g = ctx.groupHistory(inputs,'raw');
+assert.equal(g[0].rate,1/3);
+assert.equal(g[0].revenue,480000);
+assert.equal(g[1].observed,1);
+assert.equal(g[1].expected,2);
+assert.equal(g[1].revenue,null);
+assert.equal(ctx.rollup([]).rate,null);
+console.log('PASS company identity, weighted occupancy, partial coverage and historical rates');

@@ -6,7 +6,11 @@
     <meta name="booking-token" content="cloud-session" />
     <title>캠핑 인사이트 | 예약현황 통합 관리</title>
     <link rel="icon" href="data:," />
-    <style>:root {
+    <style>.business-table .company-row { background: #f0f6f4; }
+.company-row .camp-name strong { display: flex; align-items: center; gap: 5px; }
+.company-row .camp-name svg { width: 16px; height: 16px; flex: none; }
+.business-table .unit-row { color: #465552; font-size: 0.87rem; }
+:root {
   --bg: #f5f7f7;
   --white: #fff;
   --ink: #20282a;
@@ -1833,7 +1837,7 @@ dialog::backdrop {
           <div id="businessMetrics" class="business-metrics"></div>
           <div class="operating-policy"><div class="review-filters" role="group" aria-label="계산 기준"><button data-business-mode="adjusted" aria-pressed="true">보정</button><button data-business-mode="raw" aria-pressed="false">원본</button></div><span>일~목 평일 · 금·토 주말 · 최근 28일 평일 평균 100%이고 주말 평균 100% 미만일 때만 미영업 가정</span><button id="refreshBusiness" class="icon-button" title="저장 자료 재계산" aria-label="저장 자료 재계산"><i data-lucide="refresh-cw"></i></button></div>
           <div class="toolbar"><label class="search-field"><i data-lucide="search"></i><input id="summarySearch" type="search" placeholder="야영장, 분류 검색" aria-label="현황 검색"></label><button id="editOrder"><i data-lucide="arrow-up-down"></i>순서 편집</button><span id="summaryCoverage" class="muted"></span></div>
-          <div class="business-scroll"><table class="business-table"><thead><tr><th>야영장 / 분류</th><th>마감 / 객실</th><th>가동률</th><th>기준 금액</th><th>추정 매출</th><th>상태</th><th>관리</th></tr></thead><tbody id="businessRows"></tbody></table></div>
+          <div class="business-scroll"><table class="business-table"><thead><tr><th>업체 / 동·사이트</th><th>마감 / 객실</th><th>가동률</th><th>기준 단가</th><th>예상 매출</th><th>집계 상태</th><th>관리</th></tr></thead><tbody id="businessRows"></tbody></table></div>
           <p class="history-disclaimer">네이버 마감 표시 기준의 추정치입니다. 실제 예약·매출과 다를 수 있으며, 선택 날짜의 정상 수집 자료만 합산합니다.</p>
         </section>
         <section id="catalogView" class="view hidden">
@@ -2525,11 +2529,53 @@ function historyValue(h, mode) {
   return {...h, ...operatingValue({valid:true, reserved:h.reserved, total:h.total, rate:h.rate, revenue:h.revenue},
     h.business_adjustment, h.date, mode), rawReserved:h.reserved, rawTotal:h.total};
 }
+const expandedCompanies = new Set();
+function companies(entries) {
+  const groups = new Map();
+  for (const e of entries) {
+    if (e.archived) continue;
+    const id = String(e.company_id || e.key);
+    if (!groups.has(id)) groups.set(id, []);
+    groups.get(id).push(e);
+  }
+  return groups;
+}
+function companyName(group) {
+  const e = group[0];
+  return e.major && e.major !== e.sheet_title ? e.major + " / " + e.sheet_title : e.sheet_title || e.major;
+}
+function rollup(values) {
+  const valid = values.filter(v => v.valid), priced = valid.filter(v => v.revenue != null);
+  const sum = (rows, field) => rows.reduce((n,v) => n + v[field], 0);
+  const total = sum(valid, "total"), reserved = sum(valid, "reserved");
+  return {valid:valid.length > 0, observed:valid.length, priced:priced.length, total, reserved,
+    rate:total ? reserved/total : null, revenue:priced.length ? sum(priced,"revenue") : null,
+    closed:valid.length > 0 && valid.every(v => v.closed)};
+}
+function companyLabel(group) {
+  if (group.length === 1) return companyName(group);
+  const first = group[0], common = group.every(e => e.major === first.major);
+  if (common && first.major?.includes(" ")) return first.major;
+  const titles = group.map(e => e.sheet_title.split(/[ (]/)[0]);
+  const prefix = titles.every(t => t === titles[0]) ? titles[0] : first.sheet_title.split(/[ (]/)[0];
+  return [first.major, prefix].filter(Boolean).join(" / ");
+}
+function unitDetail(e, value) {
+  const booked = new Set(e.result?.reserved_rooms || []);
+  const checked = value.valid && (e.result.reserved === 0 || e.result.reserved === e.rooms.length ||
+    (Array.isArray(e.result.reserved_rooms) && booked.size === e.result.reserved && [...booked].every(r=>e.rooms.includes(r))));
+  return e.rooms.map((room,i) => {
+    const sold = checked && (e.result.reserved === e.rooms.length || booked.has(room));
+    const amount = !checked ? null : value.closed || !sold ? 0 : e.price_amount;
+    return `<tr class="unit-row"><td>　　${esc(room)}</td><td>${!checked ? "미확인" : value.closed ? "미영업 추정" : sold ? "예약 마감" : "마감 아님"}</td><td></td><td>${money(e.price_amount)}</td><td>${money(amount)}</td><td>${e.rooms.length === 1 ? "개별 단가" : "분류 기준단가"}</td><td><button class="icon-button" data-unit-price="${e.key}" data-unit-index="${i}" title="이 동의 단가 수정" aria-label="${esc(room)} 단가 수정" ${data.busy ? "disabled" : ""}>${icon("pencil")}</button></td></tr>`;
+  }).join("");
+}
 function renderSummary() {
   $("#refreshBusiness").disabled = data.busy;
   const query = $("#summarySearch").value.trim().toLocaleLowerCase();
-  const entries = data.entries.filter(e => !e.archived && [e.major, e.sheet_title, e.company_id].join(" ").toLocaleLowerCase().includes(query));
-  const signature = JSON.stringify([query, businessMode, data.busy, $("#checkin").value, entries.map(e => [e.key, e.major, e.sheet_title, e.price, e.price_amount, e.rooms.length, e.result, e.business_adjustment, e.changed, e.proposal?.changed, e.proposal?.error])]);
+  const groups = [...companies(data.entries)].filter(([,g]) => g.some(e=>[e.major,e.sheet_title,e.company_id,e.region,...e.rooms].join(" ").toLocaleLowerCase().includes(query)));
+  const entries = groups.flatMap(([,g])=>g);
+  const signature = JSON.stringify([query, [...expandedCompanies], businessMode, data.busy, $("#checkin").value, entries.map(e => [e.company_id, e.key, e.major, e.sheet_title, e.price, e.price_amount, e.rooms, e.result, e.business_adjustment, e.changed, e.proposal?.changed, e.proposal?.error])]);
   if (signature === businessSignature) return;
   businessSignature = signature;
   const values = entries.map(e => businessValue(e, businessMode)), valid = values.filter(v => v.valid);
@@ -2538,11 +2584,17 @@ function renderSummary() {
   const closed = valid.filter(v=>v.closed).length, rawPriced = valid.filter(v=>v.rawRevenue !== null);
   const rawRevenue = rawPriced.reduce((n,v)=>n+v.rawRevenue,0);
   $("#businessMetrics").innerHTML = `<div><span>${businessMode === "adjusted" ? "보정 가동률 · 영업일 기준" : "원본 가동률 · 마감 기준"}</span><strong>${total ? (100 * reserved / total).toFixed(1) + "%" : "-"}</strong><small>집계 ${reserved} / ${total}객실 · 미영업 추정 ${closed}항목 제외</small></div><div><span>${businessMode === "adjusted" ? "보정 예상매출" : "원본 예상매출"}</span><strong>${priced.length ? money(revenue) : "-"}</strong><small>원본 ${rawPriced.length ? money(rawRevenue) : "-"} · 미확인 금액은 합산 제외</small></div><div><span>정상 수집 항목</span><strong>${valid.length} / ${entries.length}</strong><small>평균 비교 자료 부족 ${valid.filter(v=>v.assumption?.reason === "insufficient").length} · 미확인 제외 ${entries.length - valid.length}</small></div>`;
-  $("#summaryCoverage").textContent = `${$("#checkin").value} · ${entries.length}개 항목`;
-  $("#businessRows").innerHTML = entries.map(e => {
+  $("#summaryCoverage").textContent = `${$("#checkin").value} · 업체 ${groups.length}곳 · 객실 분류 ${entries.length}개`;
+  $("#businessRows").innerHTML = groups.map(([id,g]) => {
+    const open = expandedCompanies.has(id), v = rollup(g.map(e=>businessValue(e,businessMode)));
+    const coverage = !v.observed ? "미수집·미확인" : v.observed < g.length || v.priced < g.length ? "부분 집계" : "집계 완료";
+    const header = `<tr class="company-row"><td><button class="camp-name" data-company-toggle="${esc(id)}" aria-expanded="${open}"><strong>${icon(open ? "chevron-down" : "chevron-right")} ${esc(companyLabel(g))}</strong><small>${esc(id)} · ${g.length}개 분류</small></button></td><td>${v.observed ? v.reserved+" / "+v.total : "-"}</td><td>${v.rate == null ? (v.closed ? "미영업 추정" : "-") : (100*v.rate).toFixed(1)+"%"}</td><td></td><td>${money(v.revenue)}</td><td>${coverage}<small>수집 ${v.observed}/${g.length} · 금액 ${v.priced}/${g.length}</small></td><td><button class="icon-button" data-company-trend="${esc(id)}" title="업체 전체 추이" aria-label="${esc(companyLabel(g))} 전체 추이">${icon("chart-no-axes-combined")}</button></td></tr>`;
+    if (!open) return header;
+    return header + g.map(e => {
     const value = businessValue(e, businessMode);
     return `<tr><td><strong>${esc(e.major)}</strong><small>${esc(e.sheet_title)}</small></td><td>${value.valid ? `${e.result.reserved} / ${e.rooms.length}` : `- / ${e.rooms.length}`}</td><td>${value.closed ? "미영업 추정" : value.rate === null ? "-" : (value.rate * 100).toFixed(1) + "%"}</td><td>${money(e.price_amount)}</td><td>${value.revenue === null ? (value.valid ? "금액 미입력" : "집계 제외") : money(value.revenue)}</td><td>${badge(e)}<small class="operating-reason">${esc(operatingLabel(value))}</small></td><td><button class="icon-button" data-summary-edit="${e.key}" title="객실·금액 수정" aria-label="${esc(e.sheet_title)} 수정">${icon("pencil")}</button><button class="icon-button" data-summary-history="${e.key}" title="누적 현황" aria-label="${esc(e.sheet_title)} 누적 현황">${icon("chart-no-axes-combined")}</button><button class="icon-button" data-summary-collect="${e.key}" title="이 항목 재수집" aria-label="${esc(e.sheet_title)} 재수집" ${data.busy ? "disabled" : ""}>${icon("refresh-cw")}</button></td></tr>`;
-  }).join("") || `<tr><td colspan="7">${empty("야영장을 추가해 주세요", "tent-tree")}</td></tr>`;
+  }).map((row,i)=>row + (g[i].rooms.length === 1 && g[i].rooms[0] === g[i].sheet_title ? "" : unitDetail(g[i], businessValue(g[i],businessMode)))).join("");
+  }).join("") || `<tr><td colspan="7">${empty(query ? "검색 결과가 없습니다" : "야영장을 추가해 주세요", "tent-tree")}</td></tr>`;
   $$("[data-summary-edit]").forEach(button => {
     const key = button.dataset.summaryEdit, entry = entries.find(e => e.key === key);
     const name = button.closest("tr").querySelector("td");
@@ -2560,22 +2612,60 @@ function cleanHistory(history) {
   }
   return [...days.values()].sort((a, b) => a.stamp - b.stamp);
 }
-async function openTrend(key) {
+function groupHistory(series, mode) {
+  const dates = new Map();
+  for (const history of series) for (const h of history) {
+    if (!dates.has(h.date)) dates.set(h.date, []);
+    dates.get(h.date).push(historyValue(h, mode));
+  }
+  return [...dates].sort(([a],[b])=>a.localeCompare(b)).map(([date,rows])=>({
+    ...rollup(rows), date, stamp:rows[0].stamp, rawTotal:rows.reduce((n,r)=>n+r.rawTotal,0),
+    rawReserved:rows.reduce((n,r)=>n+r.rawReserved,0), expected:series.length}));
+}
+function editUnitPrice(e, i) {
+  const room = e.rooms[i], revision = data.revision, split = e.rooms.length > 1;
+  const day = $("#checkin").value;
+  const source = {company_id:e.company_id, region:e.region, major:e.major, sheet_title:e.sheet_title,
+    rooms:e.rooms, price:e.price, room_authority:e.room_authority};
+  openDialog(room + " · 1박 단가", `<label>단가 (원)<input type="number" id="unitAmount" min="0" step="1" value="${e.price_amount ?? ""}"></label>
+    ${split ? '<p>이 동만 별도 분류로 옮기고 두 분류를 재수집합니다. 나머지 객실 단가와 이전 날짜 기록은 유지합니다.</p>' : ""}`,
+    [["취소",()=>$("#dialog").close()], [split ? "분리 저장 후 선택 수집" : "단가 저장", async ()=>{
+      const input = $("#unitAmount"), amount = input.valueAsNumber;
+      if (!input.value || !Number.isSafeInteger(amount) || amount < 0) throw new Error("0 이상의 원 단위 금액을 입력해 주세요.");
+      const price = String(amount);
+      let edits = [{...source,key:e.key,price}];
+      if (split) {
+        const base = (e.sheet_title+" "+room).replace(/[:\\/?*\[\]]/g," ").trim();
+        const used = new Set(data.entries.map(x=>x.sheet_title.toLowerCase()));
+        let title = base.slice(0,31);
+        for (let n=2; used.has(title.toLowerCase()); n++) title = base.slice(0,30-String(n).length)+" "+n;
+        edits = [{...source,key:e.key,rooms:e.rooms.filter((_,j)=>i!==j),room_authority:"manual"},
+          {...source,sheet_title:title,rooms:[room],price,room_authority:"manual"}];
+      }
+      const saved = await api("/api/apply",{revision,edits,...(split && data.cloud ? {collect_after:true,wait_for_completion:true,date:day} : {})});
+      $("#dialog").close(); await refresh(true);
+      if (split && !data.cloud) await start("collect",saved.keys);
+      toast(saved.queued ? "저장 요청을 접수했습니다." : saved.collection_state === "issues" ? "단가 저장 완료 · 수집 확인 필요" : "동별 단가를 저장했습니다.");
+    },true]]);
+}
+async function openTrend(key, group = null) {
   const entry = data.entries.find(e => e.key === key);
   if (!entry) return;
-  const request = {key, entry, days:90, history:[], mode:businessMode};
+  const request = {key, entry, group, days:90, history:[], mode:businessMode};
   activeTrend = request;
-  openDialog(`${entry.major} / ${entry.sheet_title} · 누적 추이`, '<div id="trendLoading" role="status">누적 자료 불러오는 중</div>', [["닫기", () => $("#dialog").close()]]);
+  openDialog(`${group ? companyLabel(group)+" · 업체 전체" : companyName([entry])} · 누적 추이`, '<div id="trendLoading" role="status">누적 자료 불러오는 중</div>', [["닫기", () => $("#dialog").close()]]);
   try {
-    const response = await api("/api/history?key=" + encodeURIComponent(key));
+    const series = await Promise.all((group || [entry]).map(async e=>cleanHistory((await api("/api/history?key=" + encodeURIComponent(e.key))).history || [])));
     if (activeTrend !== request || !$("#dialog").open || !$("#trendLoading")) return;
-    request.history = cleanHistory(response.history || []);
+    request.series = series;
+    request.history = group ? groupHistory(series,request.mode) : series[0];
     if (!request.history.length) {
       $("#dialogBody").innerHTML = empty("저장된 정상 수집 자료가 없습니다", "chart-no-axes-combined"); icons(); return;
     }
     $("#dialogBody").innerHTML = `<div class="trend-toolbar"><div class="review-filters" role="group" aria-label="추이 기간">${[7,30,90,0].map(days=>`<button data-trend-days="${days}" aria-pressed="${days === 90}">${days ? days + "일" : "전체"}</button>`).join("")}</div><span id="trendPeriod" class="muted"></span></div><div id="trendMetrics" class="business-metrics"></div><div class="trend-charts"><section><h3>가동률 추이</h3><canvas id="trendRate" aria-label="날짜별 가동률 그래프"></canvas><output id="trendRateValue"></output></section><section><h3>예상 매출 추이</h3><canvas id="trendRevenue" aria-label="날짜별 예상 매출 그래프"></canvas><output id="trendRevenueValue"></output></section></div><div class="trend-table-scroll"><table class="history-table"><thead><tr><th>체크인 날짜</th><th>마감 / 전체</th><th>가동률</th><th>기준 금액</th><th>예상 매출</th></tr></thead><tbody id="trendRows"></tbody></table></div><p class="history-disclaimer">체크인 날짜별 마지막 정상 수집 기록입니다. 같은 날짜의 재수집은 중복 합산하지 않습니다. 마감 기준 추정치이며 실제 매출과 다를 수 있습니다. 수집하지 않은 날짜와 미입력 금액은 0으로 채우지 않습니다.</p>`;
     $(".trend-toolbar").insertAdjacentHTML("afterbegin", `<div class="review-filters" role="group" aria-label="추이 계산 기준"><button data-trend-mode="adjusted">보정</button><button data-trend-mode="raw">원본</button></div>`);
     $(".trend-table-scroll thead tr").insertAdjacentHTML("beforeend", "<th>영업 보정 사유</th>");
+    if (group) $(".trend-table-scroll thead tr").innerHTML = "<th>체크인 날짜</th><th>마감 / 영업 객실</th><th>가동률</th><th>수집 분류</th><th>예상 매출</th><th>금액 확인 분류</th>";
     $("#dialogBody .history-disclaimer").textContent = "일~목 평일, 금·토 주말. 최근 28일 평일 평균이 정확히 100%이고 주말 평균은 100% 미만일 때만 평일 미영업을 가정합니다. 평일 10일·주말 4일 이상 필요하며, 하루 만실이나 단순 평균 차이로는 보정하지 않습니다. 실제 휴무·결제매출 확정이 아니며 원본 기록은 보존합니다.";
     $$("[data-trend-mode]").forEach(button => button.onclick = () => { request.mode = button.dataset.trendMode; renderTrend(); });
     $$("[data-trend-days]").forEach(button => button.onclick = () => { request.days = Number(button.dataset.trendDays); renderTrend(); });
@@ -2586,8 +2676,10 @@ async function openTrend(key) {
 }
 function renderTrend() {
   if (!activeTrend || !$("#trendRows")) return;
-  const {history, days} = activeTrend, end = history.at(-1).stamp;
-  const points = history.filter(h => !days || h.stamp >= end - (days - 1) * 86400000).map(h=>historyValue(h, activeTrend.mode));
+  const {days,group} = activeTrend;
+  const history = group ? groupHistory(activeTrend.series,activeTrend.mode) : activeTrend.history;
+  const end = history.at(-1).stamp;
+  const points = history.filter(h => !days || h.stamp >= end - (days - 1) * 86400000).map(h=>group ? h : historyValue(h, activeTrend.mode));
   const total = points.reduce((n,h)=>n+h.total,0), reserved = points.reduce((n,h)=>n+h.reserved,0);
   const priced = points.filter(h=>h.revenue !== null), revenue = priced.reduce((n,h)=>n+h.revenue,0);
   $("#trendPeriod").textContent = `${points[0].date} ~ ${points.at(-1).date}`;
@@ -2597,6 +2689,10 @@ function renderTrend() {
   $("#trendMetrics").innerHTML = `<div><span>${activeTrend.mode === "adjusted" ? "보정 가동률 · 영업일" : "원본 가동률"}</span><strong>${total ? (100 * reserved / total).toFixed(1)+"%" : "-"}</strong><small>미영업 추정 ${points.filter(h=>h.closed).length}일 제외</small></div><div><span>${activeTrend.mode === "adjusted" ? "보정" : "원본"} 예상매출 합계</span><strong>${priced.length ? money(revenue) : "-"}</strong><small>확인된 ${priced.length}/${points.length}일 · 미수집일 제외</small></div><div><span>최근 28일 비교 · ${esc(last.date)}</span><strong>평일 ${pct(a?.weekday_rate)}</strong><small>주말 ${pct(a?.weekend_rate)} · 표본 ${a?.weekday_days ?? 0} / ${a?.weekend_days ?? 0}일</small></div>`;
   $("#trendRows").innerHTML = points.slice().reverse().map(h=>`<tr><td>${esc(h.date)}</td><td>${h.rawReserved} / ${h.rawTotal}</td><td>${h.closed ? "미영업 추정" : pct(h.rate)}</td><td>${esc(h.price || "-")}</td><td>${money(h.revenue)}</td><td>${esc(operatingLabel(h))}</td></tr>`).join("");
   drawTrendChart($("#trendRate"), $("#trendRateValue"), points, "rate", "#13734d");
+  if (group) {
+    $("#trendMetrics").lastElementChild.innerHTML = `<span>최근일 분류 집계</span><strong>${last.observed} / ${group.length}</strong><small>현재 관리 중인 분류 기준 · 부족한 날은 부분 합계</small>`;
+    $("#trendRows").innerHTML = points.slice().reverse().map(h=>`<tr><td>${esc(h.date)}</td><td>${h.reserved} / ${h.total}</td><td>${h.closed ? "미영업 추정" : pct(h.rate)}</td><td>${h.observed} / ${h.expected}</td><td>${money(h.revenue)}</td><td>${h.priced} / ${h.expected}</td></tr>`).join("");
+  }
   drawTrendChart($("#trendRevenue"), $("#trendRevenueValue"), points, "revenue", "#2563a6");
 }
 function drawTrendChart(canvas, output, points, field, color) {
@@ -3445,6 +3541,20 @@ $("#editOrder").onclick = $("#catalogOrder").onclick = openOrderEditor;
 $("#addCamp").onclick = guarded(() => openAddCamp());
 $("#collectIssues").onclick = guarded(() => start("collect", data.entries.filter(e => !e.archived && needsAttention(e)).map(e => e.key)));
 $("#businessRows").onclick = guarded(async event => {
+  const unit = event.target.closest("[data-unit-price]");
+  if (unit) { editUnitPrice(data.entries.find(e=>e.key===unit.dataset.unitPrice),Number(unit.dataset.unitIndex)); return; }
+  const toggle = event.target.closest("[data-company-toggle]");
+  if (toggle) {
+    const id = toggle.dataset.companyToggle;
+    if (expandedCompanies.has(id)) expandedCompanies.delete(id); else expandedCompanies.add(id);
+    renderSummary(); icons(); return;
+  }
+  const trend = event.target.closest("[data-company-trend]");
+  if (trend) {
+    const g = companies(data.entries).get(trend.dataset.companyTrend);
+    if (g) await openTrend(g[0].key,g);
+    return;
+  }
   const edit = event.target.closest("[data-summary-edit]");
   if (edit) editModal([data.entries.find(e => e.key === edit.dataset.summaryEdit)]);
   const history = event.target.closest("[data-summary-history]");

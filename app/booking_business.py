@@ -140,6 +140,8 @@ def workbook_bytes(path, state, histories):
                 row_date = raw.date().isoformat() if hasattr(raw, "hour") else raw.isoformat() if isinstance(raw, date) else str(raw)
                 write(ws, row, 7, records.get(row_date))
             heading(ws, 7)
+        from company_report import add_company_views
+        add_company_views(wb, state, histories)
         output = io.BytesIO()
         wb.save(output)
         return output.getvalue()

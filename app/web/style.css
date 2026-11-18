@@ -1,3 +1,7 @@
+.business-table .company-row { background: #f0f6f4; }
+.company-row .camp-name strong { display: flex; align-items: center; gap: 5px; }
+.company-row .camp-name svg { width: 16px; height: 16px; flex: none; }
+.business-table .unit-row { color: #465552; font-size: 0.87rem; }
 :root {
   --bg: #f5f7f7;
   --white: #fff;
