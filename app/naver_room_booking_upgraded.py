@@ -15,11 +15,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlencode, urlsplit
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from room_classifier import filtered_snapshot, partition
-from room_stays import MAX_NIGHTS, combine_stays, required_stays, unit_title
+from room_classifier import filtered_snapshot, item_key, partition
+from room_stays import BOOKING_ITEM, MAX_NIGHTS, combine_stays, required_stays, unit_title
 
 
 APP_TITLE = "네이버 객실 예약현황 자동화 Upgrade"
@@ -1108,8 +1109,21 @@ class BrowserCollector:
                         raise
                     views[nights] = {"roomCards": [], "listingStable": False}
                     self.progress(f"{company_id}: {nights}박 조회 실패 · 미확인 유지")
+            remaining = 4
+            def confirm(product, siblings, nights):
+                nonlocal remaining
+                if remaining <= 0:
+                    return None
+                remaining -= 1
+                try:
+                    return self._confirm_unlisted(company_id, product, siblings, nights)
+                except Exception as exc:
+                    if "접근 제한" in str(exc):
+                        raise
+                    self.progress(f"{company_id}: 판매목록 교차 확인 실패 · 미확인 유지")
+                    return None
             snapshot = combine_stays(snapshot, views, self.checkin, self.status_words, known,
-                                     self._room_rules.get(company_id))
+                                     self._room_rules.get(company_id), confirm)
         self._snapshots[company_id] = snapshot
         return url, snapshot
 
@@ -1118,6 +1132,37 @@ class BrowserCollector:
         if company_id not in self._price_snapshots:
             self._price_snapshots[company_id] = self._read_snapshot(url)
         return url, self._price_snapshots[company_id]
+
+    def _confirm_unlisted(self, company_id, product, siblings, nights):
+        key = item_key(product)
+        match = BOOKING_ITEM.fullmatch(key)
+        if not match:
+            return None
+        business = match.group(1)
+        same_business = {s for s in siblings if BOOKING_ITEM.fullmatch(s) and
+                         BOOKING_ITEM.fullmatch(s).group(1) == business}
+        if not same_business:
+            return None
+        catalog_url, catalog = self.get_price_snapshot(company_id)
+        ids = {item_key(c) for c in catalog.get("roomCards", [])}
+        if (not catalog.get("listingStable") or catalog.get("url") != catalog_url or
+                key in ids or not ids.intersection(same_business)):
+            return None
+        # A missing card alone is inconclusive. A withdrawn detail page returns to
+        # the same business's functioning reservation storefront.
+        origin = "https://m.booking.naver.com"
+        target = origin + key.removeprefix("product:") + "?" + urlencode({
+            "area": "pll", "startDate": self.checkin.isoformat(),
+            "endDate": (self.checkin + timedelta(days=nights)).isoformat(),
+            "tab": "details", "theme": "place", "lang": "ko"})
+        landing = origin + business
+        self._page.goto(target, wait_until="domcontentloaded", timeout=15000)
+        self._page.wait_for_url(re.compile(re.escape(landing) + r"/?(?:\?.*)?$"), timeout=7500)
+        self._page.get_by_role("link", name="모든 객실 보기", exact=True).wait_for(timeout=5000)
+        final = urlsplit(self._page.url)
+        if final.scheme != "https" or final.netloc != "m.booking.naver.com" or final.path.rstrip("/") != business:
+            return None
+        return {"catalogUrl": catalog_url, "detailUrl": target, "redirectUrl": self._page.url}
 
     def _read_snapshot(self, url: str) -> dict:
 

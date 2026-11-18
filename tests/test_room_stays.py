@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_manager import fixture, FakeCollector
 from test_cloud import FakeBridge
@@ -127,6 +127,55 @@ class StayUnits(unittest.TestCase):
         result = combine_stays(base, {1: base, 2: view([product()], 2)}, DAY, WORDS,
                                known=[product(), product(nights=2)])
         self.assertEqual(result["roomCards"][0]["availabilityState"], "unknown")
+
+    def test_confirmed_unlisted_tariff_is_not_a_booking_and_returns_if_seen(self):
+        old = combined()["roomCards"]
+        proof = Mock(return_value={"redirectUrl": "storefront"})
+        for other in ("available", "closed"):
+            items = [product(nights=2, state=other)]
+            base = view(items)
+            card = combine_stays(base, {1: base, 2: view(items, 2)}, DAY, WORDS,
+                                 old, confirm_unlisted=proof)["roomCards"][0]
+            self.assertEqual([e["state"] for e in card["stayEvidence"]], ["not_offered", other])
+            self.assertEqual(card["availabilityState"], other)
+            self.assertEqual(len(card["memberItemKeys"]), 2)
+        items = [product(state="available"), product(nights=2)]
+        base = view(items)
+        proof.reset_mock()
+        restored = combine_stays(base, {1: base, 2: view(items, 2)}, DAY, WORDS,
+                                 [card], confirm_unlisted=proof)["roomCards"]
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(restored[0]["availabilityState"], "available")
+        proof.assert_not_called()
+
+    def test_incomplete_views_do_not_trigger_unlisting(self):
+        proof = Mock(return_value={"redirectUrl": "storefront"})
+        old = combined()["roomCards"]
+        base = view([product(nights=2)], listingStable=False)
+        result = combine_stays(base, {1: base, 2: view([product(nights=2)], 2)}, DAY, WORDS,
+                               old, confirm_unlisted=proof)
+        self.assertEqual(result["roomCards"][0]["availabilityState"], "unknown")
+        proof.assert_not_called()
+
+    def test_unlisting_requires_same_business_catalog_and_storefront(self):
+        col = core.BrowserCollector(DAY, WORDS, False, 25, lambda _: None)
+        prefix = "product:/booking/3/bizes/123/items/"
+        old, sibling = {"itemKey": prefix + "1"}, {"itemKey": prefix + "2"}
+        col._page = Mock()
+        col._page.url = "https://m.booking.naver.com/booking/3/bizes/123"
+        snap = {"listingStable": True, "url": "catalog", "roomCards": [sibling]}
+        with patch.object(col, "get_price_snapshot", return_value=("catalog", snap)):
+            self.assertIsNone(col._confirm_unlisted("123", old, ["product:/booking/3/bizes/42/items/2"], 1))
+            for cards, stable in [([sibling, old], True), ([], True), ([sibling], False)]:
+                snap.update(roomCards=cards, listingStable=stable)
+                self.assertIsNone(col._confirm_unlisted("123", old, [sibling["itemKey"]], 1))
+            col._page.goto.assert_not_called()
+            snap.update(roomCards=[sibling], listingStable=True)
+            confirmation = col._confirm_unlisted("123", old, [sibling["itemKey"]], 1)
+            self.assertIn("startDate=2026-11-17", confirmation["detailUrl"])
+            self.assertIn("endDate=2026-11-18", confirmation["detailUrl"])
+            col._page.url = "https://nid.naver.com/login"
+            self.assertIsNone(col._confirm_unlisted("123", old, [sibling["itemKey"]], 1))
 
     def test_explicit_exclusion_is_not_restored_as_an_alternative(self):
         rules = {"product:/1/2": {"mode": "exclude"}}

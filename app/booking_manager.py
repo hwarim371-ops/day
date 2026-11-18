@@ -39,7 +39,7 @@ from room_reconcile import exact_bindings, plan_changes, catalog_signature
 from booking_pricing import nightly_max, only_price_changed
 from booking_business import POLICY, assess, valid_counts
 
-VERSION = "2.10.0"
+VERSION = "2.10.1"
 
 
 class Manager:
@@ -360,7 +360,10 @@ class Manager:
                         snapshot = self.entry_snapshot(e, snapshot)
                         result = core.analyze_entry_snapshot(e, snapshot, words, "matched", url)
                         if self.manual_rooms(e) and result.missing_count:
-                            result.status = f"수동 목록 저장됨 · 화면에서 확인 못한 객실 {result.missing_count}개"
+                            if "숙박기간별 예약상태 미확인" in result.status:
+                                result.status = "수동 목록 유지 · 숙박기간별 예약상태 미확인: " + ", ".join(result.missing_rooms)
+                            else:
+                                result.status = f"수동 목록 저장됨 · 화면에서 확인 못한 객실 {result.missing_count}개"
                         if result.missing_count:
                             result.status += " · " + changes["summary"]
                         filtered, _ = filtered_snapshot(snapshot, snapshot["roomRules"])
